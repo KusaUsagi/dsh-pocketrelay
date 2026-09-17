@@ -119,7 +119,7 @@ export class HttpPlane {
         next.chunks.push(Buffer.from(frame.dataBase64, "base64"))
         return
       }
-      case T.HTTP_END: {
+      case T.HTTP_BODY_END: {
         const next = this.pending.get(id)
         if (next === undefined || next.started) return
         next.started = true

@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# packaged artifacts
+*.tgz
+
+# logs & tmp
+*.log
+.tmp/
+tmp/
+
+# editor / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# runtime / agent state (not project source)
+.omo/
+dsh-workspace/
+
+# test coverage
+coverage/

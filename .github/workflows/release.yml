@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build protocol (dep of plugin)
+        run: pnpm --filter @dsh-pocketrelay/protocol build
+      - name: Build + pack the dsh-pocketrelay plugin tarball
+        run: pnpm --filter dsh-pocketrelay pack:tgz
+      - name: Upload tarball to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/dsh-pocketrelay/dsh-pocketrelay-*.tgz
+          generate_release_notes: true

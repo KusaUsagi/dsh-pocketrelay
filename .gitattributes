@@ -1,0 +1,12 @@
+# 统一仓库行尾为 LF（跨平台一致；本地 checkout 由 git 按平台处理）
+* text=auto eol=lf
+
+*.ts text eol=lf
+*.tsx text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

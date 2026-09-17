@@ -15,7 +15,8 @@
         "useImportType": "error",
         "noNonNullAssertion": "error",
         "useEnumInitializers": "off",
-        "noParameterAssign": "error"
+        "noParameterAssign": "error",
+        "useTemplate": "off"
       },
       "correctness": {
         "noUnusedVariables": "error",

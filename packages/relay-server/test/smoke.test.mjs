@@ -61,14 +61,22 @@ test("host 注册 → 手机配对 → /d/ HTTP 转发 + /d/events/ WS 隧道", 
   assert.equal(pairJson.deviceId, DEVICE_ID)
   const cookie = pairRes.headers.get("set-cookie").split(";")[0]
 
-  // 3. host 作为响应端：http-req → head+chunk+end；ws-open → open-ok + frame
+  // 3. host 作为响应端:http-req 先登记,等 http-body-end 再回 head+chunk+end(对齐真插件契约)
+  const pending = new Map()
   hostWs.addEventListener("message", (event) => {
     const frame = JSON.parse(event.data)
     if (frame.t === "http-req") {
+      pending.set(frame.id, frame)
+      return
+    }
+    if (frame.t === "http-body-end") {
+      const r = pending.get(frame.id)
+      if (r === undefined) return
+      pending.delete(frame.id)
       hostWs.send(
         JSON.stringify({
           t: "http-head",
-          id: frame.id,
+          id: r.id,
           status: 200,
           headers: { "content-type": "text/plain" },
         }),
@@ -76,11 +84,11 @@ test("host 注册 → 手机配对 → /d/ HTTP 转发 + /d/events/ WS 隧道", 
       hostWs.send(
         JSON.stringify({
           t: "http-chunk",
-          id: frame.id,
+          id: r.id,
           dataBase64: Buffer.from("hello from host").toString("base64"),
         }),
       )
-      hostWs.send(JSON.stringify({ t: "http-end", id: frame.id }))
+      hostWs.send(JSON.stringify({ t: "http-end", id: r.id }))
       return
     }
     if (frame.t === "ws-open") {

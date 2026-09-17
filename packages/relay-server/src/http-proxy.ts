@@ -148,8 +148,10 @@ export class HttpProxy {
         const slice = body.subarray(i, i + HTTP_CHUNK_BYTES)
         this.opts.sendToHost(deviceId, { t: T.HTTP_BODY, id, dataBase64: slice.toString("base64") })
       }
-      this.opts.sendToHost(deviceId, { t: T.HTTP_BODY_END, id })
     }
+    // 始终发 http-body-end:host 端 http-plane 收到 body-end 才执行 run()。即便 body
+    // 内联在 http-req 里或为空也必须发,否则 host 永不执行 → 手机端读条卡死。
+    this.opts.sendToHost(deviceId, { t: T.HTTP_BODY_END, id })
   }
 
   /** host→relay 响应/WS 帧分发。由 WsBridge 的 onHostFrame 调用。 */

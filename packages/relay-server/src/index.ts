@@ -14,6 +14,7 @@ import {
   ADMIN_SESSION_TTL_MS,
   DEFAULT_BIND,
   DEFAULT_PORT,
+  SESSION_COOKIE,
   defaultDataDir,
 } from "./const.js"
 import { HttpProxy } from "./http-proxy.js"
@@ -86,13 +87,21 @@ export async function createRelay(opts: RelayOptions): Promise<RelayHandle> {
       wsBridge.handleUpgrade(req, socket, head)
       return
     }
+    // /d/<deviceId>/events/* (显式) 或凭 session cookie 的 /events/* (dsh web 根相对 WS) → host WS 隧道
+    let deviceId: string | undefined
+    let rest: string | undefined
     if (parts[0] === "d" && parts.length >= 2) {
-      const deviceId = parts[1]
-      if (deviceId === undefined) {
-        socket.destroy()
-        return
+      deviceId = parts[1]
+      rest = "/" + parts.slice(2).join("/")
+    } else {
+      const sid = readCookie(req.headers.cookie, SESSION_COOKIE)
+      const session = sid !== null ? sessions.getPhone(sid) : null
+      if (session !== null) {
+        deviceId = session.deviceId
+        rest = new URL(req.url ?? "/", "http://relay").pathname
       }
-      const rest = "/" + parts.slice(2).join("/")
+    }
+    if (deviceId !== undefined && rest !== undefined) {
       proxy?.handleEventsUpgrade(req, socket, head, deviceId, rest)
       return
     }
@@ -131,7 +140,15 @@ async function handleRequest(
   adminHash: string,
 ): Promise<void> {
   const parts = pathParts(req.url ?? "/")
-  if (parts.length === 0) return html(res, landingPage())
+  // 凭 session cookie 转发:已配对手机的根相对请求(/,/assets/,/api/,/events/...)都走隧道到 host
+  const phoneSid = readCookie(req.headers.cookie, SESSION_COOKIE)
+  const phoneSession = phoneSid !== null ? sessions.getPhone(phoneSid) : null
+  if (parts.length === 0) {
+    if (phoneSession !== null && proxy !== undefined) {
+      return proxy.handleHttpRequest(req, res, phoneSession.deviceId, "/")
+    }
+    return html(res, landingPage())
+  }
   switch (parts[0]) {
     case "pair":
       if (req.method === "GET") return html(res, pairPage())
@@ -151,6 +168,10 @@ async function handleRequest(
       return proxy.handleHttpRequest(req, res, deviceId, "/" + parts.slice(2).join("/"))
     }
     default:
+      if (phoneSession !== null && proxy !== undefined) {
+        const fullpath = new URL(req.url ?? "/", "http://relay").pathname
+        return proxy.handleHttpRequest(req, res, phoneSession.deviceId, fullpath)
+      }
       return notFound(res)
   }
 }

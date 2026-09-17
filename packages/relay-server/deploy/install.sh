@@ -8,20 +8,23 @@ DATA_DIR="${DSH_POCKETRELAY_DATA_DIR:-/var/lib/dsh-pocketrelay}"
 HOST_TOKEN="${DSH_POCKETRELAY_HOST_TOKEN:-}"
 PORT="${DSH_POCKETRELAY_PORT:-8443}"
 ADMIN_PW="${DSH_POCKETRELAY_ADMIN_PASSWORD:-}"
-REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)" # 项目根
+REPO_DIR="$(cd "$(dirname "$0")/../../.." && pwd)" # 项目根（deploy 上 3 级：deploy→relay-server→packages→根）
 
 if [ "$(id -u)" -ne 0 ]; then echo "需要 root（systemd）" >&2; exit 1; fi
 
-# 1. Node >= 22
-if ! command -v node >/dev/null 2>&1; then
-  echo "未安装 Node。安装 Node 22 后重试：https://github.com/nodesource/distributions" >&2
+# 1. Node >= 22（优先 /usr/local/bin/node——官方二进制安装位置；绕过 sudo secure_path 取不到它的问题）
+if [ -x /usr/local/bin/node ]; then NODE_BIN=/usr/local/bin/node
+else NODE_BIN="$(command -v node || true)"; fi
+if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
+  echo "未安装 Node。装 Node 22 后重试（官方二进制：https://nodejs.org/dist/）" >&2
   exit 1
 fi
-if ! node -e "process.exit(Number(process.versions.node.split('.')[0])>=22?0:1)"; then
-  echo "需要 Node >= 22（当前 $(node -v)）" >&2
+if ! "$NODE_BIN" -e "process.exit(Number(process.versions.node.split('.')[0])>=22?0:1)"; then
+  echo "需要 Node >= 22（当前 $("$NODE_BIN" -v)）" >&2
   exit 1
 fi
-command -v pnpm >/dev/null 2>&1 || npm install -g pnpm
+# pnpm：corepack 已不随 Node 22 分发，用与项目对齐的 9.15.0（npm 与 node 同目录）
+command -v pnpm >/dev/null 2>&1 || "$(dirname "$NODE_BIN")/npm" install -g pnpm@9.15.0
 
 # 2. 构建
 cd "$REPO_DIR"
@@ -40,7 +43,7 @@ fi
 
 # 4. systemd unit
 if [ -z "$HOST_TOKEN" ]; then echo "需要 DSH_POCKETRELAY_HOST_TOKEN" >&2; exit 1; fi
-NODE_BIN="$(command -v node)"
+# NODE_BIN 已在上方解析（优先 /usr/local/bin/node）
 cat > /etc/systemd/system/dsh-pocketrelay.service <<UNIT
 [Unit]
 Description=dsh-pocketrelay relay

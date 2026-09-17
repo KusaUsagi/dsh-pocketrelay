@@ -119,7 +119,7 @@ export class HttpPlane {
         next.chunks.push(Buffer.from(frame.dataBase64, "base64"))
         return
       }
-      case T.HTTP_BODY_END: {
+      case T.HTTP_END: {
         const next = this.pending.get(id)
         if (next === undefined || next.started) return
         next.started = true
@@ -207,6 +207,7 @@ export class HttpPlane {
       response = await this.fetchUpstream(next, controller.signal)
     }
 
+    this.options.log("fetch id=" + next.id + " status=" + response.status + " ct=" + (response.headers.get("content-type") ?? ""))
     const responseHeaders: Record<string, string> = {}
     response.headers.forEach((value, key) => {
       const lower = key.toLowerCase()
@@ -222,7 +223,7 @@ export class HttpPlane {
 
     if (response.body === null) {
       this.pending.delete(next.id)
-      this.options.send({ t: T.HTTP_BODY_END, id: next.id })
+      this.options.send({ t: T.HTTP_END, id: next.id })
       return
     }
 
@@ -238,13 +239,13 @@ export class HttpPlane {
       if (value.byteLength > 0) this.sendBuffered(next, Buffer.from(value))
     }
     this.pending.delete(next.id)
-    this.options.send({ t: T.HTTP_BODY_END, id: next.id })
+    this.options.send({ t: T.HTTP_END, id: next.id })
   }
 
   private sendBuffered(next: Pending, body: Buffer): void {
     for (let offset = 0; offset < body.byteLength; offset += HTTP_CHUNK_BYTES) {
       const piece = body.subarray(offset, offset + HTTP_CHUNK_BYTES)
-      this.options.send({ t: T.HTTP_BODY, id: next.id, dataBase64: piece.toString("base64") })
+      this.options.send({ t: T.HTTP_CHUNK, id: next.id, dataBase64: piece.toString("base64") })
     }
   }
 
@@ -265,6 +266,6 @@ export class HttpPlane {
     const html = injectMobileShim(Buffer.concat(chunks).toString("utf8"))
     this.sendBuffered(next, Buffer.from(html, "utf8"))
     this.pending.delete(next.id)
-    this.options.send({ t: T.HTTP_BODY_END, id: next.id })
+    this.options.send({ t: T.HTTP_END, id: next.id })
   }
 }

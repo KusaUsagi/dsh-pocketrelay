@@ -2,17 +2,19 @@
  * dsh-pocketrelay — structured data plane, host side.
  *
  * The relay's `data-req` frames become direct calls into injected DSH SDK
- * services: `ctx.sessions` (list — session lifecycle), `ctx.fs` (file store).
- * The SDK shapes are UNCONFIRMED and the stock web profile does NOT register
- * apiProxy/host (so conversation history/prompt need either enabling apiProxy
- * or the dsh web HTTP API — under investigation). Every surface is probed at
- * runtime and degrades to `ok:false` instead of throwing. `handle` is
- * fire-and-forget; every frame is answered exactly once.
+ * services: `ctx.apiProxy` (sessions.list/history/prompt, host.describe) and
+ * `ctx.fs` (resolve/listDir/readText/writeText). apiProxy is loaded via the
+ * `api-gateway` bundle row inserted by this plugin's cordis.patch.yml (the
+ * stock web-app bundle should have it, but some dsh versions ship without it;
+ * the insert ensures ctx.apiProxy is available). The SDK shapes are probed at
+ * runtime and degrade to `ok:false` per-kind: a missing service fails only its
+ * own ops (no apiProxy → conversation ops fail, but file ops still work via
+ * fs). `handle` is fire-and-forget; every frame is answered exactly once.
  *
- * IMPORTANT: service methods are PROTOTYPE methods that read `this.*`
- * internally — invoke with method-call syntax (`sessions.list({})`,
- * `fs.resolve(p)`) to preserve `this`; detaching throws
- * "Cannot read properties of undefined (reading 'store')".
+ * IMPORTANT: service methods are PROTOTYPE methods that read `this.*` internally
+ * — invoke with method-call syntax (`apiProxy.sessions.list({})`, `fs.resolve(p)`)
+ * to preserve `this`; detaching (`const m = obj.method; m(...)`) loses `this`
+ * and throws "Cannot read properties of undefined (reading 'store')".
  */
 import {
   assertNever,
@@ -32,6 +34,10 @@ interface SessionsCap {
 }
 interface HostCap {
   describe?: (args: unknown) => Promise<unknown>
+}
+interface ApiProxyCap {
+  sessions?: SessionsCap
+  host?: HostCap
 }
 interface FsCap {
   resolve?: (path: unknown) => unknown
@@ -62,12 +68,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/**
- * Describe a service cap: own enumerable keys + ALL function names found by
- * walking the ENTIRE prototype chain (methods are non-enumerable, so Object.keys
- * misses them; a single getPrototypeOf only sees the immediate layer). Reveals
- * the full API surface for diagnosis.
- */
+/** Describe a cap: own keys + ALL function names walking the full proto chain. */
 function describeCap(label: string, cap: unknown): string {
   if (typeof cap !== "object" || cap === null) return `${label}=UNDEFINED`
   const own = Object.keys(cap)
@@ -90,26 +91,18 @@ function describeCap(label: string, cap: unknown): string {
 }
 
 export class DataPlane {
-  private sessions: SessionsCap | undefined = undefined
-  private host: HostCap | undefined = undefined
+  private apiProxy: ApiProxyCap | undefined = undefined
   private fs: FsCap | undefined = undefined
 
   constructor(private readonly options: DataPlaneOptions) {}
 
-  setSessions(sessions: unknown): void {
-    this.sessions =
-      typeof sessions === "object" && sessions !== null ? (sessions as SessionsCap) : undefined
-    console.warn(`[dsh-pocketrelay/data] ${describeCap("setSessions", this.sessions)}`)
-  }
-
-  setHost(host: unknown): void {
-    this.host = typeof host === "object" && host !== null ? (host as HostCap) : undefined
-    console.warn(`[dsh-pocketrelay/data] ${describeCap("setHost", this.host)}`)
-  }
-
-  setFs(fs: unknown): void {
+  /** Set the apiProxy + fs caps (from ctx.get or ctx.inject). */
+  setCaps(apiProxy: unknown, fs: unknown): void {
+    this.apiProxy =
+      typeof apiProxy === "object" && apiProxy !== null ? (apiProxy as ApiProxyCap) : undefined
     this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
-    console.warn(`[dsh-pocketrelay/data] ${describeCap("setFs", this.fs)}`)
+    console.warn(`[dsh-pocketrelay/data] ${describeCap("setCaps.apiProxy", this.apiProxy)}`)
+    console.warn(`[dsh-pocketrelay/data] ${describeCap("setCaps.fs", this.fs)}`)
   }
 
   handle(frame: DataReqFrame): void {
@@ -120,6 +113,7 @@ export class DataPlane {
   }
 
   private async run(frame: DataReqFrame): Promise<void> {
+    // Per-kind: conversation ops need apiProxy; file ops need fs.
     try {
       switch (frame.kind) {
         case "conversation":
@@ -146,38 +140,43 @@ export class DataPlane {
   }
 
   private async conversation(frame: DataReqFrame): Promise<void> {
-    const sessions = this.sessions
-    if (sessions === undefined) {
-      this.respond(frame, false, undefined, "sessions service unavailable")
+    const apiProxy = this.apiProxy
+    if (apiProxy === undefined) {
+      this.respond(
+        frame,
+        false,
+        undefined,
+        "apiProxy unavailable (api-gateway bundle row not loaded)",
+      )
       return
     }
-    // Method-call syntax preserves `this=sessions`.
+    // Method-call syntax preserves `this`.
     if (frame.sessionId !== undefined) {
-      if (typeof sessions.history !== "function") {
-        this.respond(
-          frame,
-          false,
-          undefined,
-          "sessions.history unavailable (likely needs apiProxy)",
-        )
+      if (typeof apiProxy.sessions?.history !== "function") {
+        this.respond(frame, false, undefined, "apiProxy.sessions.history unavailable")
         return
       }
-      const data = await sessions.history({ sessionId: frame.sessionId, maxMessages: 200 })
+      const data = await apiProxy.sessions.history({ sessionId: frame.sessionId, maxMessages: 200 })
       this.respondData(frame, data)
       return
     }
-    if (typeof sessions.list !== "function") {
-      this.respond(frame, false, undefined, "sessions.list unavailable")
+    if (typeof apiProxy.sessions?.list !== "function") {
+      this.respond(frame, false, undefined, "apiProxy.sessions.list unavailable")
       return
     }
-    const data = await sessions.list({})
+    const data = await apiProxy.sessions.list({})
     this.respondData(frame, data)
   }
 
   private async sendMessage(frame: DataReqFrame): Promise<void> {
-    const sessions = this.sessions
-    if (sessions === undefined) {
-      this.respond(frame, false, undefined, "sessions service unavailable")
+    const apiProxy = this.apiProxy
+    if (apiProxy === undefined) {
+      this.respond(
+        frame,
+        false,
+        undefined,
+        "apiProxy unavailable (api-gateway bundle row not loaded)",
+      )
       return
     }
     const sessionId = frame.sessionId
@@ -186,11 +185,11 @@ export class DataPlane {
       this.respond(frame, false, undefined, "sessionId and content required")
       return
     }
-    if (typeof sessions.prompt !== "function") {
-      this.respond(frame, false, undefined, "sessions.prompt unavailable (likely needs apiProxy)")
+    if (typeof apiProxy.sessions?.prompt !== "function") {
+      this.respond(frame, false, undefined, "apiProxy.sessions.prompt unavailable")
       return
     }
-    const data = await sessions.prompt({
+    const data = await apiProxy.sessions.prompt({
       sessionId,
       content: [{ type: "text", text: content }],
       mode: "queue",
@@ -212,37 +211,9 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
-    // No explicit path → probe several inputs; fs.resolve's expected arg shape
-    // is UNCONFIRMED (it returned undefined for "." in 0.2.5). Try string paths
-    // + an object form; use the first that yields a non-null target.
-    const inputs: unknown[] =
-      frame.path !== undefined ? [frame.path] : [".", "", "/", { path: "." }]
-    let target: unknown
-    const tried: string[] = []
-    for (const inp of inputs) {
-      try {
-        const r = fs.resolve(inp)
-        const desc = r === undefined ? "undefined" : r === null ? "null" : typeof r
-        tried.push(`${typeof inp === "string" ? JSON.stringify(inp) : "obj"}→${desc}`)
-        if (r !== undefined && r !== null) {
-          target = r
-          break
-        }
-      } catch (e) {
-        tried.push(
-          `${typeof inp === "string" ? JSON.stringify(inp) : "obj"}→threw:${errorMessage(e)}`,
-        )
-      }
-    }
-    if (target === undefined || target === null) {
-      this.respond(
-        frame,
-        false,
-        undefined,
-        `fs.resolve yielded no target; tried: ${tried.join(" | ")}`,
-      )
-      return
-    }
+    // No path → resolve "." (the workspace cwd target). resolve takes a string
+    // path and returns an FsTarget (confirmed); method-call preserves this.
+    const target = fs.resolve(frame.path ?? ".")
     const data = await fs.listDir(target)
     this.respondData(frame, data)
   }
@@ -285,17 +256,12 @@ export class DataPlane {
     this.respond(frame, true)
   }
 
-  /**
-   * Serialize + size-guard a successful SDK result, then respond ok:true. Logs
-   * the result SHAPE before the size check so oversized results (e.g.
-   * sessions.list returning the full store) still reveal what they are.
-   */
+  /** Serialize + size-guard a result; logs shape BEFORE the size check. */
   private respondData(frame: DataReqFrame, data: unknown): void {
     if (data === undefined) {
       this.respond(frame, true)
       return
     }
-    // Log shape BEFORE the size guard (oversized results are the common failure).
     const shape =
       data === null
         ? "null"

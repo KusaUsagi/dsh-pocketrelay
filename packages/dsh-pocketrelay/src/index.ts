@@ -3,14 +3,15 @@
  *
  * 自托管中继的桌面端 agent（契约见 docs/PROTOCOL.md）：持有稳定的 deviceId
  * 注册到 relay，把手机经 relay 发来的 data-req 结构化数据帧用注入的
- * sessions/host/fs 能力应答，回送 data-res。运行时配置（设置 → 手机连接）
+ * apiProxy/fs 能力应答，回送 data-res。运行时配置（设置 → 手机连接）
  * 持久化于 `<dshHome>/storages/dsh-pocketrelay/config.json`，覆盖
  * cordis.patch.yml 默认值。SDK 服务形态未确认；缺失时数据面降级为
  * ok:false（见 data-plane.ts 的兜底守卫），控制面与设置 UI 不受影响。
  *
- * NOTE: apiProxy（包装 sessions/host）在 stock web profile 未注册，故直接
- * 访问底层 sessions/host/fs 服务（它们已注册）。每个服务独立 inject（避免
- * all-or-nothing 的 ["apiProxy","fs"] 组合），并辅以 ctx.get 探测即时可用性。
+ * apiProxy 由本插件 cordis.patch.yml 插入的 api-gateway bundle 行加载
+ * （@deepseek-ai/dsh-host-apiproxy；stock web-app bundle 应有但部分 dsh 版本
+ * 缺失，故显式插入以确保 ctx.apiProxy 可用）。ctx.get 探测即时可用性，
+ * ctx.inject(['apiProxy','fs']) 为 canonical 路径（两者都加载后触发）。
  */
 import { hostname } from "node:os"
 import { join } from "node:path"
@@ -29,20 +30,16 @@ export const name = "dsh-pocketrelay"
 export const Config = RemoteSettingsSchema
 
 /**
- * Services the plugin waits for before apply. Only `webServer` gates plugin load
- * (control-plane settings UI + routes). `sessions`/`host`/`fs` are requested
- * inside apply via ctx.inject (each independently, so one missing doesn't block
- * the others) + probed via ctx.get (immediate availability) — the data plane
- * degrades per-kind when a service is absent.
+ * Services the plugin waits for before apply. `webServer` gates plugin load.
+ * `apiProxy`/`fs` are requested inside apply via ctx.inject + probed via ctx.get
+ * (immediate availability) — the data plane degrades per-kind when a cap is absent.
  */
 export const inject = ["webServer"]
 
 export async function apply(ctx: Context, config: RemoteSettings): Promise<void> {
   const log = ctx.logger(name)
   const dir = join(resolveDshHome(), "storages", "dsh-pocketrelay")
-  console.warn(
-    "[dsh-pocketrelay] apply started; waiting on webServer (plugin inject) + sessions/host/fs",
-  )
+  console.warn("[dsh-pocketrelay] apply started; waiting on webServer + apiProxy/fs")
 
   const identity = await loadIdentity(dir)
   const settings = await loadSettings(dir, {
@@ -66,29 +63,20 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
   agent.setFrameSink((frame) => dataPlane.handle(frame))
 
   // Probe immediate availability via ctx.get (the cordis bypass — no inject
-  // needed; dsh-remote uses webCtx.get('connection') the same way). Direct
-  // ctx.<name> reads THROW "cannot get property without inject", so use ctx.get.
+  // needed). Direct ctx.<name> reads throw "cannot get without inject", so ctx.get.
   probeAndSet(ctx, dataPlane, "apply-top")
 
-  // Per-service injects (each fires independently when its service materializes
-  // — avoids the all-or-nothing ["apiProxy","fs"] group that never resolved
-  // because apiProxy isn't registered in the web profile).
-  ctx.inject(["sessions"], (caps) => {
-    console.warn("[dsh-pocketrelay] ctx.inject(['sessions']) resolved")
-    dataPlane.setSessions(caps.get("sessions"))
-  })
-  ctx.inject(["host"], (caps) => {
-    console.warn("[dsh-pocketrelay] ctx.inject(['host']) resolved")
-    dataPlane.setHost(caps.get("host"))
-  })
-  ctx.inject(["fs"], (caps) => {
-    console.warn("[dsh-pocketrelay] ctx.inject(['fs']) resolved")
-    dataPlane.setFs(caps.get("fs"))
+  // Canonical path: fires once both apiProxy + fs are available. apiProxy is
+  // loaded by the api-gateway bundle row (inserted in cordis.patch.yml); fs by
+  // the base bundle. If apiProxy fails to load (bundle row/pkg issue), this
+  // never fires but probeAndSet still sets fs → file ops work, conv ops degrade.
+  ctx.inject(["apiProxy", "fs"], (caps) => {
+    console.warn("[dsh-pocketrelay] ctx.inject(['apiProxy','fs']) resolved — calling setCaps")
+    dataPlane.setCaps(caps.get("apiProxy"), caps.get("fs"))
   })
 
   ctx.inject(["webServer"], (webCtx) => {
     webCtx.effect(() => {
-      // probe again after webServer materializes (services may appear by then)
       probeAndSet(webCtx, dataPlane, "webServer-effect")
       const disposeRoutes = registerRemoteRoutes(webCtx.webServer, {
         agent,
@@ -105,17 +93,18 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
 }
 
 /**
- * Probe which DSH services are registered in this profile via `ctx.get(name)`
- * (the cordis bypass lookup — usable without declaring inject). Direct
- * `ctx.<name>` reads throw "cannot get property without inject", so we use
- * ctx.get exclusively. For each object returned, call the matching setter on the
- * data plane; log the typeof + Object.keys of each so the exact shapes are
- * visible (the data plane's probing interfaces may need adjustment based on the
- * real method names).
+ * Probe which DSH services are registered via `ctx.get(name)` (the cordis bypass
+ * lookup — usable without declaring inject). Direct `ctx.<name>` reads throw
+ * "cannot get property without inject", so we use ctx.get. If apiProxy + fs are
+ * available, call setCaps immediately (covers the case where ctx.inject hasn't
+ * fired yet but the services are already registered). Logs each typeof + keys so
+ * the exact shapes are visible.
  */
 function probeAndSet(ctx: Context, dataPlane: DataPlane, label: string): void {
   const names = ["apiProxy", "sessions", "host", "fs"] as const
   const parts: string[] = []
+  let gAp: unknown
+  let gFp: unknown
   for (const n of names) {
     let v: unknown
     try {
@@ -126,13 +115,18 @@ function probeAndSet(ctx: Context, dataPlane: DataPlane, label: string): void {
     let desc: string
     if (typeof v === "object" && v !== null) {
       desc = `object{${Object.keys(v).slice(0, 12).join(",")}}`
-      if (n === "sessions") dataPlane.setSessions(v)
-      else if (n === "host") dataPlane.setHost(v)
-      else if (n === "fs") dataPlane.setFs(v)
+      if (n === "apiProxy") gAp = v
+      else if (n === "fs") gFp = v
     } else {
       desc = typeof v
     }
     parts.push(`${n}=${desc}`)
   }
   console.warn(`[dsh-pocketrelay] probe(${label}): ${parts.join(" ")}`)
+  if (gAp !== undefined || gFp !== undefined) {
+    console.warn(
+      `[dsh-pocketrelay] probe(${label}): setCaps apiProxy=${gAp !== undefined} fs=${gFp !== undefined}`,
+    )
+    dataPlane.setCaps(gAp, gFp)
+  }
 }

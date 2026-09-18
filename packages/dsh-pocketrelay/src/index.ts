@@ -35,6 +35,9 @@ export const inject = ["webServer"]
 export async function apply(ctx: Context, config: RemoteSettings): Promise<void> {
   const log = ctx.logger(name)
   const dir = join(resolveDshHome(), "storages", "dsh-pocketrelay")
+  console.warn(
+    "[dsh-pocketrelay] apply started; waiting on webServer (plugin inject) + ctx.inject(['apiProxy','fs'])",
+  )
 
   const identity = await loadIdentity(dir)
   const settings = await loadSettings(dir, {
@@ -66,6 +69,7 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
       // the plugin survives their absence (caps stay undefined → every
       // data-req degrades to ok:false inside data-plane.ts).
       ctx.inject(["apiProxy", "fs"], (caps) => {
+        console.warn("[dsh-pocketrelay] ctx.inject(['apiProxy','fs']) resolved — calling setCaps")
         dataPlane.setCaps(caps.get("apiProxy"), caps.get("fs"))
       })
 

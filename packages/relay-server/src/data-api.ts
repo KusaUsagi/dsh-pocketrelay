@@ -77,6 +77,7 @@ export class DataApi {
     const qs = url.searchParams
     const method = (req.method ?? "GET").toUpperCase()
     const deviceId = session.deviceId
+    this.opts.log(`api ${method} ${path} device=${deviceId.slice(0, 8)}`)
 
     if (method === "GET" && path === "/api/sessions") {
       return this.mint(res, deviceId, { kind: "conversation" })
@@ -134,6 +135,9 @@ export class DataApi {
     inflight.settled = true
     clearTimeout(inflight.timer)
     this.pending.delete(frame.id)
+    this.opts.log(
+      `settle id=${frame.id} kind=${frame.kind} ok=${frame.ok}${frame.ok ? "" : ` error=${frame.error ?? ""}`}`,
+    )
     if (frame.ok) {
       const body: { ok: true; data?: unknown } = { ok: true }
       if (frame.data !== undefined) body.data = frame.data
@@ -169,7 +173,9 @@ export class DataApi {
   private mint(res: ServerResponse, deviceId: string, spec: DataReqSpec): void {
     const id = this.nextId++
     const frame = buildDataReq(id, spec)
-    if (!this.opts.sendToHost(deviceId, frame)) {
+    const sent = this.opts.sendToHost(deviceId, frame)
+    this.opts.log(`mint id=${id} kind=${spec.kind} device=${deviceId.slice(0, 8)} sent=${sent}`)
+    if (!sent) {
       fail(res, 503, "host offline")
       return
     }

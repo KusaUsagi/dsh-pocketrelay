@@ -566,7 +566,10 @@ a{color:var(--accent);}
       hideOffline();
       if (r.status >= 400){
         return r.text().catch(function(){ return ''; }).then(function(t){
-          throw new Error(t || ('HTTP ' + r.status));
+          var msg;
+          try { var j = JSON.parse(t); msg = j.error || j.message || t; } catch(e){ msg = t || ('HTTP ' + r.status); }
+          toast('请求失败 (' + r.status + ')：' + msg);
+          throw new Error(msg);
         });
       }
       var ct = r.headers.get('content-type') || '';

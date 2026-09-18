@@ -84,12 +84,20 @@ export class DataPlane {
 
   /** Called once `ctx.inject(["apiProxy", "fs"])` resolves; caps stay undefined until then. */
   setCaps(apiProxy: unknown, fs: unknown): void {
-    this.apiProxy =
+    const ap =
       typeof apiProxy === "object" && apiProxy !== null ? (apiProxy as ApiProxyCap) : undefined
-    this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
+    const fp = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
+    this.apiProxy = ap
+    this.fs = fp
+    console.warn(
+      `[dsh-pocketrelay/data] setCaps: apiProxy=${ap === undefined ? "UNDEFINED" : `object{${Object.keys(ap).join(",")}}`} fs=${fp === undefined ? "UNDEFINED" : `object{${Object.keys(fp).join(",")}}`}`,
+    )
   }
 
   handle(frame: DataReqFrame): void {
+    console.warn(
+      `[dsh-pocketrelay/data] data-req received: kind=${frame.kind} id=${frame.id}${frame.path ? ` path=${frame.path}` : ""}${frame.sessionId ? ` sessionId=${frame.sessionId}` : ""}`,
+    )
     void this.run(frame)
   }
 
@@ -97,6 +105,9 @@ export class DataPlane {
     const apiProxy = this.apiProxy
     const fs = this.fs
     if (apiProxy === undefined || fs === undefined) {
+      console.warn(
+        `[dsh-pocketrelay/data] caps NOT ready (apiProxy=${this.apiProxy === undefined ? "UNDEFINED" : "set"} fs=${this.fs === undefined ? "UNDEFINED" : "set"}) — ctx.inject(['apiProxy','fs']) did not fire or returned null`,
+      )
       this.respond(frame, false, undefined, "host capabilities not ready")
       return
     }
@@ -270,6 +281,19 @@ export class DataPlane {
     if (!ok && error !== undefined) {
       this.options.log(`data-res ${frame.kind} ${frame.id} failed: ${error}`)
     }
+    const dataDesc =
+      data === undefined
+        ? "none"
+        : data === null
+          ? "null"
+          : Array.isArray(data)
+            ? `array[${data.length}]`
+            : isRecord(data)
+              ? `object{${Object.keys(data).join(",")}}`
+              : typeof data
+    console.warn(
+      `[dsh-pocketrelay/data] data-res: kind=${frame.kind} id=${frame.id} ok=${ok}${ok ? ` data=${dataDesc}` : ` error=${error ?? ""}`}`,
+    )
     const res: MutableDataRes = {
       t: T.DATA_RES,
       id: frame.id,

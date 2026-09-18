@@ -2,25 +2,17 @@
  * dsh-pocketrelay — structured data plane, host side.
  *
  * The relay's `data-req` frames become direct calls into injected DSH SDK
- * services: `ctx.sessions` (list/history/prompt), `ctx.host` (describe → cwd),
- * and `ctx.fs` (resolve/listDir/readText/writeText). The SDK shapes are
- * UNCONFIRMED, so every surface is probed at runtime and degrades to `ok:false`
- * instead of throwing: a service may be absent in this dsh profile (e.g.
- * sessions not registered → conversation ops fail, but file ops still work via
- * fs), a method may be missing, the result may not be JSON-serializable, or it
- * may blow the 1 MiB `data-res` ceiling. `handle` is fire-and-forget; every
- * frame is answered exactly once.
+ * services: `ctx.sessions` (list — session lifecycle), `ctx.fs` (file store).
+ * The SDK shapes are UNCONFIRMED and the stock web profile does NOT register
+ * apiProxy/host (so conversation history/prompt need either enabling apiProxy
+ * or the dsh web HTTP API — under investigation). Every surface is probed at
+ * runtime and degrades to `ok:false` instead of throwing. `handle` is
+ * fire-and-forget; every frame is answered exactly once.
  *
- * IMPORTANT: the service methods (list/history/prompt/describe/resolve/listDir/
- * readText/writeText) are PROTOTYPE methods — they read `this.store`/`this.*`
- * internally, so they MUST be invoked with method-call syntax (`sessions.list({})`,
- * `fs.resolve(p)`) to preserve `this`. Detaching (`const m = sessions.list; m({})`)
- * loses `this` and throws "Cannot read properties of undefined (reading 'store')".
- *
- * NOTE: apiProxy (which wraps sessions/host) is not registered in the stock web
- * profile, so we access sessions/host/fs directly. host is also absent in the
- * stock profile, so pathless file-list falls back to `fs.resolve(".")` instead
- * of host.describe.
+ * IMPORTANT: service methods are PROTOTYPE methods that read `this.*`
+ * internally — invoke with method-call syntax (`sessions.list({})`,
+ * `fs.resolve(p)`) to preserve `this`; detaching throws
+ * "Cannot read properties of undefined (reading 'store')".
  */
 import {
   assertNever,
@@ -33,23 +25,14 @@ import {
 /** 1 MiB serialized ceiling for a `data-res` frame (string length, not bytes). */
 const MAX_PAYLOAD_CHARS = 1048576
 
-/**
- * Local probing surface of the unconfirmed `ctx.sessions` (or apiProxy.sessions).
- * Methods are optional because the real shape is unknown; each is narrowed with
- * `typeof === "function"` before invocation (and called with method-call syntax).
- */
 interface SessionsCap {
   list?: (args: unknown) => Promise<unknown>
   history?: (args: unknown) => Promise<unknown>
   prompt?: (args: unknown) => Promise<unknown>
 }
-
-/** Local probing surface of the unconfirmed `ctx.host` (or apiProxy.host). */
 interface HostCap {
   describe?: (args: unknown) => Promise<unknown>
 }
-
-/** Local probing surface of the unconfirmed `ctx.fs` (harness working directory). */
 interface FsCap {
   resolve?: (path: unknown) => unknown
   listDir?: (path: unknown) => Promise<unknown>
@@ -57,7 +40,6 @@ interface FsCap {
   writeText?: (path: unknown, content: unknown) => Promise<unknown>
 }
 
-/** Mutable twin of `DataResFrame`, built for the conditional `data`/`error` fields. */
 interface MutableDataRes {
   t: "data-res"
   id: number
@@ -81,27 +63,30 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * Describe a service cap: own enumerable keys + the prototype's FUNCTION names.
- * Service methods (list/history/prompt/resolve/...) live on the prototype and
- * are NON-enumerable, so `Object.keys` misses them — `getPrototypeOf` +
- * `getOwnPropertyNames` reveals the real API surface for diagnosis.
+ * Describe a service cap: own enumerable keys + ALL function names found by
+ * walking the ENTIRE prototype chain (methods are non-enumerable, so Object.keys
+ * misses them; a single getPrototypeOf only sees the immediate layer). Reveals
+ * the full API surface for diagnosis.
  */
 function describeCap(label: string, cap: unknown): string {
   if (typeof cap !== "object" || cap === null) return `${label}=UNDEFINED`
   const own = Object.keys(cap)
-  const protoFns: string[] = []
-  try {
-    const p = Object.getPrototypeOf(cap)
-    if (p !== null && p !== Object.prototype) {
-      const rec = cap as Record<string, unknown>
+  const fns = new Set<string>()
+  const rec = cap as Record<string, unknown>
+  let p: object | null = Object.getPrototypeOf(cap)
+  let depth = 0
+  while (p !== null && p !== Object.prototype && depth < 6) {
+    try {
       for (const n of Object.getOwnPropertyNames(p)) {
-        if (typeof rec[n] === "function") protoFns.push(n)
+        if (typeof rec[n] === "function") fns.add(n)
       }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
+    p = Object.getPrototypeOf(p)
+    depth += 1
   }
-  return `${label}=own{${own.join(",")}} proto{${protoFns.slice(0, 24).join(",")}}`
+  return `${label}=own{${own.join(",")}} fns{${[...fns].slice(0, 40).join(",")}}`
 }
 
 export class DataPlane {
@@ -111,20 +96,17 @@ export class DataPlane {
 
   constructor(private readonly options: DataPlaneOptions) {}
 
-  /** Set the `sessions` cap (from ctx.get("sessions") or ctx.inject(["sessions"])). */
   setSessions(sessions: unknown): void {
     this.sessions =
       typeof sessions === "object" && sessions !== null ? (sessions as SessionsCap) : undefined
     console.warn(`[dsh-pocketrelay/data] ${describeCap("setSessions", this.sessions)}`)
   }
 
-  /** Set the `host` cap (from ctx.get("host") or ctx.inject(["host"])). */
   setHost(host: unknown): void {
     this.host = typeof host === "object" && host !== null ? (host as HostCap) : undefined
     console.warn(`[dsh-pocketrelay/data] ${describeCap("setHost", this.host)}`)
   }
 
-  /** Set the `fs` cap (from ctx.get("fs") or ctx.inject(["fs"])). */
   setFs(fs: unknown): void {
     this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
     console.warn(`[dsh-pocketrelay/data] ${describeCap("setFs", this.fs)}`)
@@ -138,8 +120,6 @@ export class DataPlane {
   }
 
   private async run(frame: DataReqFrame): Promise<void> {
-    // Per-kind cap checks: file ops need only fs; conversation ops need sessions.
-    // A profile missing one service still serves the others.
     try {
       switch (frame.kind) {
         case "conversation":
@@ -168,20 +148,18 @@ export class DataPlane {
   private async conversation(frame: DataReqFrame): Promise<void> {
     const sessions = this.sessions
     if (sessions === undefined) {
-      this.respond(
-        frame,
-        false,
-        undefined,
-        "sessions service unavailable (not registered in this dsh profile)",
-      )
+      this.respond(frame, false, undefined, "sessions service unavailable")
       return
     }
-    // Method-call syntax (sessions.history({...})) preserves `this=sessions`;
-    // detaching (const h = sessions.history; h({...})) loses `this` and throws
-    // "Cannot read properties of undefined (reading 'store')".
+    // Method-call syntax preserves `this=sessions`.
     if (frame.sessionId !== undefined) {
       if (typeof sessions.history !== "function") {
-        this.respond(frame, false, undefined, "sessions.history unavailable")
+        this.respond(
+          frame,
+          false,
+          undefined,
+          "sessions.history unavailable (likely needs apiProxy)",
+        )
         return
       }
       const data = await sessions.history({ sessionId: frame.sessionId, maxMessages: 200 })
@@ -199,12 +177,7 @@ export class DataPlane {
   private async sendMessage(frame: DataReqFrame): Promise<void> {
     const sessions = this.sessions
     if (sessions === undefined) {
-      this.respond(
-        frame,
-        false,
-        undefined,
-        "sessions service unavailable (not registered in this dsh profile)",
-      )
+      this.respond(frame, false, undefined, "sessions service unavailable")
       return
     }
     const sessionId = frame.sessionId
@@ -214,7 +187,7 @@ export class DataPlane {
       return
     }
     if (typeof sessions.prompt !== "function") {
-      this.respond(frame, false, undefined, "sessions.prompt unavailable")
+      this.respond(frame, false, undefined, "sessions.prompt unavailable (likely needs apiProxy)")
       return
     }
     const data = await sessions.prompt({
@@ -239,9 +212,37 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
-    // No explicit path → resolve "." (the workspace root). Avoids host.describe
-    // (host service is also absent in the stock web profile).
-    const target = fs.resolve(frame.path ?? ".")
+    // No explicit path → probe several inputs; fs.resolve's expected arg shape
+    // is UNCONFIRMED (it returned undefined for "." in 0.2.5). Try string paths
+    // + an object form; use the first that yields a non-null target.
+    const inputs: unknown[] =
+      frame.path !== undefined ? [frame.path] : [".", "", "/", { path: "." }]
+    let target: unknown
+    const tried: string[] = []
+    for (const inp of inputs) {
+      try {
+        const r = fs.resolve(inp)
+        const desc = r === undefined ? "undefined" : r === null ? "null" : typeof r
+        tried.push(`${typeof inp === "string" ? JSON.stringify(inp) : "obj"}→${desc}`)
+        if (r !== undefined && r !== null) {
+          target = r
+          break
+        }
+      } catch (e) {
+        tried.push(
+          `${typeof inp === "string" ? JSON.stringify(inp) : "obj"}→threw:${errorMessage(e)}`,
+        )
+      }
+    }
+    if (target === undefined || target === null) {
+      this.respond(
+        frame,
+        false,
+        undefined,
+        `fs.resolve yielded no target; tried: ${tried.join(" | ")}`,
+      )
+      return
+    }
     const data = await fs.listDir(target)
     this.respondData(frame, data)
   }
@@ -285,15 +286,25 @@ export class DataPlane {
   }
 
   /**
-   * Serialize + size-guard a successful SDK result, then respond ok:true. The
-   * result itself is passed through verbatim (never reshaped).
+   * Serialize + size-guard a successful SDK result, then respond ok:true. Logs
+   * the result SHAPE before the size check so oversized results (e.g.
+   * sessions.list returning the full store) still reveal what they are.
    */
   private respondData(frame: DataReqFrame, data: unknown): void {
     if (data === undefined) {
-      // SDK returned nothing — succeed with no data field (omit, not undefined).
       this.respond(frame, true)
       return
     }
+    // Log shape BEFORE the size guard (oversized results are the common failure).
+    const shape =
+      data === null
+        ? "null"
+        : Array.isArray(data)
+          ? `array[${data.length}]${data.length > 0 && typeof data[0] === "object" && data[0] !== null ? ` first{${Object.keys(data[0]).join(",")}}` : ""}`
+          : isRecord(data)
+            ? `object{${Object.keys(data).join(",")}}`
+            : typeof data
+    console.warn(`[dsh-pocketrelay/data] result shape: kind=${frame.kind} ${shape}`)
     let serialized: unknown
     try {
       serialized = JSON.stringify(data)

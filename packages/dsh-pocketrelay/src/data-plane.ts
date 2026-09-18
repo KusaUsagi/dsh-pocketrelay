@@ -1,15 +1,19 @@
 /**
  * dsh-pocketrelay — structured data plane, host side.
  *
- * The relay's `data-req` frames become direct calls into the injected DSH SDK —
- * `ctx.apiProxy` for conversation/session effects and `ctx.fs` for the harness
- * working-directory file store — with the SDK result streamed back verbatim as a
- * `data-res` frame. The SDK shapes are UNCONFIRMED, so the module probes every
- * surface at runtime and degrades to `ok:false` instead of throwing: the caps may
- * be absent (they only exist once `ctx.inject(["apiProxy", "fs"])` resolves), a
- * method may be missing, the result may not be JSON-serializable, or it may blow
- * the 1 MiB `data-res` ceiling. `handle` is fire-and-forget; every frame is
- * answered exactly once.
+ * The relay's `data-req` frames become direct calls into injected DSH SDK
+ * services: `ctx.sessions` (list/history/prompt), `ctx.host` (describe → cwd),
+ * and `ctx.fs` (resolve/listDir/readText/writeText). The SDK shapes are
+ * UNCONFIRMED, so every surface is probed at runtime and degrades to `ok:false`
+ * instead of throwing: a service may be absent in this dsh profile (e.g.
+ * sessions not registered → conversation ops fail, but file ops still work via
+ * fs), a method may be missing, the result may not be JSON-serializable, or it
+ * may blow the 1 MiB `data-res` ceiling. `handle` is fire-and-forget; every
+ * frame is answered exactly once.
+ *
+ * NOTE: the original design used `ctx.apiProxy` (which wraps sessions/host), but
+ * apiProxy is not registered in the stock web profile — so we access the
+ * underlying `sessions`/`host` services directly (they ARE registered), plus `fs`.
  */
 import {
   assertNever,
@@ -22,24 +26,16 @@ import {
 /** 1 MiB serialized ceiling for a `data-res` frame (string length, not bytes). */
 const MAX_PAYLOAD_CHARS = 1048576
 
-/**
- * Local probing surface of the unconfirmed `ctx.apiProxy`. Fields and methods are
- * all optional because the real shape is unknown; each method is narrowed with
- * `typeof === "function"` before it is invoked, never trusted statically.
- */
+/** Local probing surface of the unconfirmed `ctx.sessions` (or apiProxy.sessions). */
 interface SessionsCap {
   list?: (args: unknown) => Promise<unknown>
   history?: (args: unknown) => Promise<unknown>
   prompt?: (args: unknown) => Promise<unknown>
 }
 
+/** Local probing surface of the unconfirmed `ctx.host` (or apiProxy.host). */
 interface HostCap {
   describe?: (args: unknown) => Promise<unknown>
-}
-
-interface ApiProxyCap {
-  sessions?: SessionsCap
-  host?: HostCap
 }
 
 /** Local probing surface of the unconfirmed `ctx.fs` (harness working directory). */
@@ -74,23 +70,37 @@ function errorMessage(error: unknown): string {
 }
 
 export class DataPlane {
-  private apiProxy: ApiProxyCap | undefined = undefined
+  private sessions: SessionsCap | undefined = undefined
+  private host: HostCap | undefined = undefined
   private fs: FsCap | undefined = undefined
 
-  /** One in-flight `apiProxy.host.describe({})` promise, dropped on reject. */
+  /** One in-flight `host.describe({})` promise, dropped on reject. */
   private cwdPromise: Promise<string> | undefined = undefined
 
   constructor(private readonly options: DataPlaneOptions) {}
 
-  /** Called once `ctx.inject(["apiProxy", "fs"])` resolves; caps stay undefined until then. */
-  setCaps(apiProxy: unknown, fs: unknown): void {
-    const ap =
-      typeof apiProxy === "object" && apiProxy !== null ? (apiProxy as ApiProxyCap) : undefined
-    const fp = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
-    this.apiProxy = ap
-    this.fs = fp
+  /** Set the `sessions` cap (from ctx.get("sessions") or ctx.inject(["sessions"])). */
+  setSessions(sessions: unknown): void {
+    this.sessions =
+      typeof sessions === "object" && sessions !== null ? (sessions as SessionsCap) : undefined
     console.warn(
-      `[dsh-pocketrelay/data] setCaps: apiProxy=${ap === undefined ? "UNDEFINED" : `object{${Object.keys(ap).join(",")}}`} fs=${fp === undefined ? "UNDEFINED" : `object{${Object.keys(fp).join(",")}}`}`,
+      `[dsh-pocketrelay/data] setSessions: ${this.sessions === undefined ? "UNDEFINED" : `object{${Object.keys(this.sessions).join(",")}}`}`,
+    )
+  }
+
+  /** Set the `host` cap (from ctx.get("host") or ctx.inject(["host"])). */
+  setHost(host: unknown): void {
+    this.host = typeof host === "object" && host !== null ? (host as HostCap) : undefined
+    console.warn(
+      `[dsh-pocketrelay/data] setHost: ${this.host === undefined ? "UNDEFINED" : `object{${Object.keys(this.host).join(",")}}`}`,
+    )
+  }
+
+  /** Set the `fs` cap (from ctx.get("fs") or ctx.inject(["fs"])). */
+  setFs(fs: unknown): void {
+    this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
+    console.warn(
+      `[dsh-pocketrelay/data] setFs: ${this.fs === undefined ? "UNDEFINED" : `object{${Object.keys(this.fs).join(",")}}`}`,
     )
   }
 
@@ -102,31 +112,25 @@ export class DataPlane {
   }
 
   private async run(frame: DataReqFrame): Promise<void> {
-    const apiProxy = this.apiProxy
-    const fs = this.fs
-    if (apiProxy === undefined || fs === undefined) {
-      console.warn(
-        `[dsh-pocketrelay/data] caps NOT ready (apiProxy=${this.apiProxy === undefined ? "UNDEFINED" : "set"} fs=${this.fs === undefined ? "UNDEFINED" : "set"}) — ctx.inject(['apiProxy','fs']) did not fire or returned null`,
-      )
-      this.respond(frame, false, undefined, "host capabilities not ready")
-      return
-    }
+    // Per-kind cap checks (not a global both-check): file ops need only fs;
+    // conversation ops need sessions; cwd resolution (pathless file-list) needs
+    // host. A profile missing one service still serves the others.
     try {
       switch (frame.kind) {
         case "conversation":
-          await this.conversation(frame, apiProxy)
+          await this.conversation(frame)
           return
         case "send-message":
-          await this.sendMessage(frame, apiProxy)
+          await this.sendMessage(frame)
           return
         case "file-list":
-          await this.fileList(frame, fs)
+          await this.fileList(frame)
           return
         case "file-read":
-          await this.fileRead(frame, fs)
+          await this.fileRead(frame)
           return
         case "file-write":
-          await this.fileWrite(frame, fs)
+          await this.fileWrite(frame)
           return
         default:
           assertNever(frame.kind)
@@ -136,36 +140,56 @@ export class DataPlane {
     }
   }
 
-  private async conversation(frame: DataReqFrame, apiProxy: ApiProxyCap): Promise<void> {
+  private async conversation(frame: DataReqFrame): Promise<void> {
+    const sessions = this.sessions
+    if (sessions === undefined) {
+      this.respond(
+        frame,
+        false,
+        undefined,
+        "sessions service unavailable (not registered in this dsh profile)",
+      )
+      return
+    }
     if (frame.sessionId !== undefined) {
-      const history = apiProxy.sessions?.history
+      const history = sessions.history
       if (typeof history !== "function") {
-        this.respond(frame, false, undefined, "history unavailable")
+        this.respond(frame, false, undefined, "sessions.history unavailable")
         return
       }
       const data = await history({ sessionId: frame.sessionId, maxMessages: 200 })
       this.respondData(frame, data)
       return
     }
-    const list = apiProxy.sessions?.list
+    const list = sessions.list
     if (typeof list !== "function") {
-      this.respond(frame, false, undefined, "list unavailable")
+      this.respond(frame, false, undefined, "sessions.list unavailable")
       return
     }
     const data = await list({})
     this.respondData(frame, data)
   }
 
-  private async sendMessage(frame: DataReqFrame, apiProxy: ApiProxyCap): Promise<void> {
+  private async sendMessage(frame: DataReqFrame): Promise<void> {
+    const sessions = this.sessions
+    if (sessions === undefined) {
+      this.respond(
+        frame,
+        false,
+        undefined,
+        "sessions service unavailable (not registered in this dsh profile)",
+      )
+      return
+    }
     const sessionId = frame.sessionId
     const content = frame.content
     if (sessionId === undefined || content === undefined) {
       this.respond(frame, false, undefined, "sessionId and content required")
       return
     }
-    const prompt = apiProxy.sessions?.prompt
+    const prompt = sessions.prompt
     if (typeof prompt !== "function") {
-      this.respond(frame, false, undefined, "prompt unavailable")
+      this.respond(frame, false, undefined, "sessions.prompt unavailable")
       return
     }
     const data = await prompt({
@@ -176,45 +200,60 @@ export class DataPlane {
     this.respondData(frame, data)
   }
 
-  private async fileList(frame: DataReqFrame, fs: FsCap): Promise<void> {
+  private async fileList(frame: DataReqFrame): Promise<void> {
+    const fs = this.fs
+    if (fs === undefined) {
+      this.respond(frame, false, undefined, "fs service unavailable")
+      return
+    }
     const resolve = fs.resolve
     const listDir = fs.listDir
     if (typeof resolve !== "function") {
-      this.respond(frame, false, undefined, "resolve unavailable")
+      this.respond(frame, false, undefined, "fs.resolve unavailable")
       return
     }
     if (typeof listDir !== "function") {
-      this.respond(frame, false, undefined, "listDir unavailable")
+      this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
     const data = await listDir(resolve(frame.path ?? (await this.getCwd())))
     this.respondData(frame, data)
   }
 
-  private async fileRead(frame: DataReqFrame, fs: FsCap): Promise<void> {
+  private async fileRead(frame: DataReqFrame): Promise<void> {
+    const fs = this.fs
+    if (fs === undefined) {
+      this.respond(frame, false, undefined, "fs service unavailable")
+      return
+    }
     const resolve = fs.resolve
     const readText = fs.readText
     if (typeof resolve !== "function") {
-      this.respond(frame, false, undefined, "resolve unavailable")
+      this.respond(frame, false, undefined, "fs.resolve unavailable")
       return
     }
     if (typeof readText !== "function") {
-      this.respond(frame, false, undefined, "readText unavailable")
+      this.respond(frame, false, undefined, "fs.readText unavailable")
       return
     }
     const data = await readText(resolve(frame.path))
     this.respondData(frame, data)
   }
 
-  private async fileWrite(frame: DataReqFrame, fs: FsCap): Promise<void> {
+  private async fileWrite(frame: DataReqFrame): Promise<void> {
+    const fs = this.fs
+    if (fs === undefined) {
+      this.respond(frame, false, undefined, "fs service unavailable")
+      return
+    }
     const resolve = fs.resolve
     const writeText = fs.writeText
     if (typeof resolve !== "function") {
-      this.respond(frame, false, undefined, "resolve unavailable")
+      this.respond(frame, false, undefined, "fs.resolve unavailable")
       return
     }
     if (typeof writeText !== "function") {
-      this.respond(frame, false, undefined, "writeText unavailable")
+      this.respond(frame, false, undefined, "fs.writeText unavailable")
       return
     }
     await writeText(resolve(frame.path), frame.content)
@@ -251,17 +290,18 @@ export class DataPlane {
   }
 
   /**
-   * Cached cwd lookup: one in-flight `apiProxy.host.describe({})` promise, so a
-   * burst of `file-list` frames shares a single call. On reject the cache is
-   * dropped and the rejection rethrown to the caller (next call retries).
+   * Cached cwd lookup: one in-flight `host.describe({})` promise. On reject the
+   * cache is dropped and the rejection rethrown (next call retries). Needs the
+   * `host` service; if absent, throws (caught by run → ok:false) — pathless
+   * file-list then can't resolve a relative path; callers should pass a path.
    */
   private getCwd(): Promise<string> {
     const cached = this.cwdPromise
     if (cached !== undefined) return cached
 
-    const describe = this.apiProxy?.host?.describe
+    const describe = this.host?.describe
     if (typeof describe !== "function") {
-      throw new Error("host.describe unavailable")
+      throw new Error("host.describe unavailable (host service not registered)")
     }
 
     const promise = describe({}).then((result): string => {

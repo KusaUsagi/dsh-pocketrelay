@@ -19,28 +19,43 @@
 - relay: packages/relay-server (0.2.2) — 移动 UI + /api 路由翻译成 data-req + data-res 关联引擎
 - host: packages/dsh-pocketrelay (0.2.8) — data-plane.ts 应答 data-req
 
-## 当前阻塞问题（0.2.8 的 401）
+## 当前阻塞问题（0.2.8 的 401）— 已确诊
 0.2.8 的桌面日志:
 ```
 [dsh-pocketrelay/data] data-res: kind=conversation id=16 ok=false error=HTTP 401 Unauthorized
 ```
-- 对话操作（conversation）现在走 HTTP API: `POST http://127.0.0.1:<port>/api/session.list` 等
-- 返回 401 → **dsh web 的信任边界（trust fence）未通过**
-- librarian 研究结论: `isTrustedApiRequest` 检查 `Host` header (loopback 通过) + `Origin` (若存在须匹配) + `sec-fetch-site` (cross-site 拒绝)
-- 但实际返回 401 → 可能:
-  1. Node `fetch` 自动设置了 `Origin` header（与 Host 不匹配）→ 拒绝
-  2. 或 0.1.5-rc.2 的信任逻辑与 librarian 研究的 master 版本不同
-  3. 或需要额外的 header（如 token/cookie）
+**根因已确认**（读了本地 `dsh-client-connection` 源码 `lib/index.js` line 554-555）:
+```js
+// Apply the configured Host/Origin fence, then browser authentication.
+if (!isTrustedApiRequest(request, this.trustedHosts)) return 403;  // trust fence (Host/Origin/sec-fetch)
+return this.browserAuth.isAuthenticated(request) ? void 0 : 401;   // browser AUTH (signed cookie)
+```
+- 用户得到 **401 (不是 403)** → trust fence **通过了**（loopback Host OK）→ 但 `browserAuth.isAuthenticated` 返回 false → **请求缺少签名 cookie**
+- dsh web 的认证模型（README.zh.md line 35,39）: 每个进程生成随机启动令牌；`dsh web:` 打印 `?token=...` URL；浏览器访问 `GET /?token=` → `authorizeIndex` 写入绑定 authority 的签名 cookie → 之后 /api 请求凭 cookie 认证。**缺失/过期/不匹配的 cookie → 401（在 RPC 分发前）**
+- 本插件的 `fetch` 没带 cookie → 401。**不是 trust fence 问题，是 cookie 认证问题**
 
-## 下一步（0.2.9）
-1. **诊断 401**: 在 `data-plane.ts` 的 `apiCall` 里，fetch 时显式设置 headers（不设 Origin、设 `sec-fetch-site: same-origin`、或加 `Host: 127.0.0.1:<port>`），然后 log response 的 status + headers + body，看 401 的具体原因
-2. **可能修复**:
-   - 显式不设 Origin（Node fetch 默认不设，但某些版本会设）
-   - 设 `sec-fetch-site: same-origin` 或 `sec-fetch-mode: cors`
-   - 如果 dsh web 需要 token → 从 `webCtx.webServer` 或 `ctx.webStartup` 获取 token，加到 URL 或 header
-   - 如果 401 持续 → 可能需要用 `InProcessApiClient`（但需要 apiProxy，不在本插件 scope）或直接调用 connection 插件的内部函数
-3. **文件操作**: 0.2.8 的 fs 已确认有 resolve/listDir/readText/writeText（proto chain），method-call 语法保留 `this`。用户尚未报告文件是否 work（0.2.8 对话 401 后可能未测文件）。确认 file-list/file-read/file-write 的 ok 值
-4. bump 0.2.9, rebuild host tgz, 用户本地安装测试
+## 下一步（0.2.9）— 修复 401（cookie 认证）
+**核心**: 插件需要先获取签名 cookie，再带 cookie 调用 /api
+
+1. **获取启动 token**: `dsh web:` 打印的 URL 带 `?token=...`。token 源:
+   - 可能 `ctx.webStartup`（但 `WebStartupValues` 类型只有 openBrowser/host/port/trustedHosts，**没有 token 字段** — 已确认）
+   - token 可能在 `ctx.connection`（client-connection 服务）或 browserAuth 内部生成
+   - **下一步**: grep `dsh-client-connection/lib/*.js` 找 token 生成 + `authorizeIndex` 的实现，确认 token 怎么拿到（可能 `ctx.connection` 有方法，或从 webStartup 的某个内部字段）
+2. **获取 cookie**: 拿到 token 后，`fetch GET http://127.0.0.1:<port>/?token=<token>` → 捕获 `Set-Cookie` header → 存起来
+3. **带 cookie 调 /api**: `apiCall` 的 fetch 加 `cookie` header（用存的签名 cookie）→ 应该过 browserAuth → 200
+4. **替代方案**: 检查 `ctx.connection` 是否有 in-process RPC（`ctx.connection.rpc`）能直接调 session 方法（绕过 HTTP/cookie）。README 说 connection 提供"通用 RPC"
+5. **文件操作**: 0.2.8 的 fs 已确认有 resolve/listDir/readText/writeText（proto chain），method-call 保留 this。用户未报告文件是否 work — 确认 file-list/file-read/file-write 的 ok 值
+6. bump 0.2.9, rebuild host tgz, 用户本地安装测试
+
+## 关键源码位置（0.1.5-rc.2 本地安装）
+- dsh-client-connection: `C:\Users\13776\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-client-connection\lib\index.js`
+  - line 201-207: `isTrustedApiRequest` (Host loopback + Origin + sec-fetch-site)
+  - line 381, 419, 423, 442-443, 554-555, 612: 401/403 + writeUnauthorized
+  - line 524, 531-536: trustedHosts + constructor
+- dsh-web-app: `...\@deepseek-ai\dsh-web-app\lib\` (startup.js, index.js, types/*.d.ts)
+  - `WebStartupValues` (startup.d.ts): openBrowser, host?, port?, trustedHosts[] — NO token
+  - README.md/zh.md line 37,54: token + cookie 流程描述
+- dsh-client-connection README.zh.md line 35,39: 认证模型详述（token → cookie → 401）
 
 ## 已确认的关键事实（调试 0.2.1-0.2.8 的发现）
 - **dsh 版本**: 0.1.5-rc.2（`@deepseek-ai/dsh` npm）

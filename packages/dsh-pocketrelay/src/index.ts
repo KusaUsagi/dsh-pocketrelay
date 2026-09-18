@@ -46,45 +46,89 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
     autoConnect: config.autoConnect,
   })
 
+  const agent = new RelayAgent({
+    deviceId: identity.deviceId,
+    relayUrl: settings.relayUrl,
+    hostToken: settings.hostToken,
+    hostName: hostname(),
+    log: (message) => log.info(message),
+  })
+
+  const dataPlane = new DataPlane({
+    log: (message) => log.warn(message),
+    send: (frame) => agent.sendFrame(frame),
+  })
+  agent.setFrameSink((frame) => dataPlane.handle(frame))
+
+  // DIAGNOSTIC + direct-set: dsh may expose apiProxy/fs as direct ctx properties
+  // (not injectable services). Probe + setCaps immediately if either path yields
+  // objects — covers both the direct-property case and the service-but-inject-
+  // not-firing case. Probed again inside the webServer effect (caps may
+  // materialize after webServer comes up).
+  probeAndSet(ctx, dataPlane, "apply-top")
+
+  // TOP-LEVEL inject (was nested in webCtx.effect — cordis may not fire injects
+  // registered inside an effect callback; moved to top level so the dependency
+  // registers at context activation, same as the working webServer inject).
+  ctx.inject(["apiProxy", "fs"], (caps) => {
+    console.warn("[dsh-pocketrelay] ctx.inject(['apiProxy','fs']) resolved — calling setCaps")
+    dataPlane.setCaps(caps.get("apiProxy"), caps.get("fs"))
+  })
+
   ctx.inject(["webServer"], (webCtx) => {
     webCtx.effect(() => {
-      const agent = new RelayAgent({
-        deviceId: identity.deviceId,
-        relayUrl: settings.relayUrl,
-        hostToken: settings.hostToken,
-        hostName: hostname(),
-        log: (message) => log.info(message),
-      })
-
-      const dataPlane = new DataPlane({
-        log: (message) => log.warn(message),
-        send: (frame) => agent.sendFrame(frame),
-      })
-
-      // Route inbound data-req frames (relay→host) to the data plane; the
-      // plane answers via agent.sendFrame with a correlated data-res.
-      agent.setFrameSink((frame) => dataPlane.handle(frame))
-
-      // apiProxy/fs are UNCONFIRMED SDK capabilities; request them lazily so
-      // the plugin survives their absence (caps stay undefined → every
-      // data-req degrades to ok:false inside data-plane.ts).
-      ctx.inject(["apiProxy", "fs"], (caps) => {
-        console.warn("[dsh-pocketrelay] ctx.inject(['apiProxy','fs']) resolved — calling setCaps")
-        dataPlane.setCaps(caps.get("apiProxy"), caps.get("fs"))
-      })
-
+      probeAndSet(webCtx, dataPlane, "webServer-effect")
       const disposeRoutes = registerRemoteRoutes(webCtx.webServer, {
         agent,
         settings,
         save: (next) => saveSettings(dir, next),
       })
-
       if (settings.autoConnect && settings.relayUrl.trim() !== "") agent.start()
-
       return () => {
         disposeRoutes()
         agent.dispose()
       }
     }, "dsh-pocketrelay: host agent")
   })
+}
+
+/**
+ * Probe how dsh exposes apiProxy/fs — direct ctx property (`ctx.apiProxy`) vs
+ * injectable service (`ctx.get("apiProxy")`) — and call setCaps immediately if
+ * either path yields both caps as objects. Logs the probe result for diagnosis.
+ */
+function probeAndSet(ctx: Context, dataPlane: DataPlane, label: string): void {
+  const apProp = ctx.apiProxy
+  const fpProp = ctx.fs
+  let gAp: unknown
+  let gFp: unknown
+  try {
+    gAp = ctx.get("apiProxy")
+  } catch {
+    // ctx.get may throw for unregistered names on some DI containers
+  }
+  try {
+    gFp = ctx.get("fs")
+  } catch {
+    // ignore
+  }
+  console.warn(
+    `[dsh-pocketrelay] probe(${label}): ctx.apiProxy=${typeof apProp} ctx.fs=${typeof fpProp} get('apiProxy')=${gAp === undefined ? "undefined" : typeof gAp} get('fs')=${gFp === undefined ? "undefined" : typeof gFp}`,
+  )
+  const capAp =
+    typeof apProp === "object" && apProp !== null
+      ? apProp
+      : typeof gAp === "object" && gAp !== null
+        ? gAp
+        : undefined
+  const capFp =
+    typeof fpProp === "object" && fpProp !== null
+      ? fpProp
+      : typeof gFp === "object" && gFp !== null
+        ? gFp
+        : undefined
+  if (capAp !== undefined && capFp !== undefined) {
+    console.warn(`[dsh-pocketrelay] probe(${label}): caps available — calling setCaps`)
+    dataPlane.setCaps(capAp, capFp)
+  }
 }

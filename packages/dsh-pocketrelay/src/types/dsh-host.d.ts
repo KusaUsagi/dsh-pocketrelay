@@ -43,6 +43,12 @@ declare module "@deepseek-ai/cordis" {
     effect(body: () => undefined | (() => void), label?: string): () => void
     webServer: import("@deepseek-ai/dsh-host-webserver").WebServer
     slots: SlotRegistry
+    /**
+     * DIAGNOSTIC (0.2.2): dsh may expose these as direct ctx properties rather than
+     * injectable services. Probed at runtime in apply(); narrowed in data-plane.ts.
+     */
+    apiProxy?: unknown
+    fs?: unknown
   }
 }
 

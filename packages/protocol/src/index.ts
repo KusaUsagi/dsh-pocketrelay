@@ -199,6 +199,35 @@ export interface WsCloseFrame {
   readonly reason?: string
 }
 
+/** relay→host：结构化数据请求（新数据面，取代 http/ws 反代）。 */
+export type DataReqKind =
+  | "conversation"
+  | "file-list"
+  | "file-read"
+  | "file-write"
+  | "send-message"
+
+export interface DataReqFrame {
+  readonly t: "data-req"
+  readonly id: number
+  readonly kind: DataReqKind
+  /** file-read/file-write 的路径；send-message/conversation 的会话 id（可选，缺省取活动会话）。 */
+  readonly path?: string
+  /** file-write 的内容；send-message 的用户消息文本。 */
+  readonly content?: string
+  readonly sessionId?: string
+}
+
+/** host→relay：结构化数据响应。data 形状按 kind 由 relay/host 约定（conversation=消息数组,file-list=目录项,file-read=文本,…）。 */
+export interface DataResFrame {
+  readonly t: "data-res"
+  readonly id: number
+  readonly kind: DataReqKind
+  readonly ok: boolean
+  readonly data?: unknown
+  readonly error?: string
+}
+
 /** 协议所有帧的判别联合；消费方必须用 exhaustive switch 处理。 */
 export type Frame =
   | HelloHostFrame
@@ -225,6 +254,8 @@ export type Frame =
   | WsOpenErrFrame
   | WsFrameFrame
   | WsCloseFrame
+  | DataReqFrame
+  | DataResFrame
 
 /** exhaustive switch 兜底：新增帧类型时编译期即报错。 */
 export function assertNever(value: never): never {

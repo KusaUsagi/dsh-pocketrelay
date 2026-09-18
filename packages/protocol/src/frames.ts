@@ -28,6 +28,9 @@ export const T = {
   HTTP_CHUNK: "http-chunk",
   HTTP_END: "http-end",
   HTTP_ERR: "http-err",
+  // structured data plane (relay ↔ host: relay asks, host answers via apiProxy/fs)
+  DATA_REQ: "data-req",
+  DATA_RES: "data-res",
   // websocket tunnel plane
   WS_OPEN: "ws-open",
   WS_OPEN_OK: "ws-open-ok",

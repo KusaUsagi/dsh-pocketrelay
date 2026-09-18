@@ -26,7 +26,7 @@ export function pairPage(): string {
          const code = new FormData(e.target).get('code');
          const r = await fetch('/pair', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({code}) });
          const j = await r.json().catch(() => ({}));
-         if (j.ok && j.deviceId) { location.href = '/d/' + j.deviceId + '/'; }
+          if (j.ok && j.deviceId) { location.href = '/'; }
          else { document.getElementById('m').textContent = j.error || '配对失败'; }
        });
      </script>`,

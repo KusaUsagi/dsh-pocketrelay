@@ -187,19 +187,12 @@ export class WsBridge {
         return
       case T.REVOKED:
         return
-      case T.HTTP_HEAD:
-      case T.HTTP_CHUNK:
-      case T.HTTP_END:
-      case T.HTTP_ERR:
-      case T.HTTP_ABORT:
-      case T.WS_OPEN_OK:
-      case T.WS_OPEN_ERR:
-      case T.WS_FRAME:
-      case T.WS_CLOSE:
+      case T.DATA_RES:
         this.opts.onHostFrame(conn.deviceId, frame)
         return
       default:
-        // hello/hello-ok/hello-deny/pair/peer/revoke 由 relay 发出，host 不应回送；忽略。
+        // hello/hello-ok/hello-deny/pair/peer/revoke 由 relay 发出，host 不应回送；
+        // http-*/ws-* 反代帧已废弃；均忽略。
         return
     }
   }

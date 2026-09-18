@@ -1,9 +1,9 @@
 # @dsh-pocketrelay/relay-server
 
-公网中继：手机浏览器经此访问桌面端 DeepSeek Harness。配对鉴权、HTTP/WS 反向代理、管理台。
+公网中继：手机浏览器经此远程使用桌面端 DeepSeek Harness。配对鉴权、移动 UI 与 /api 数据面、管理台。
 
 ```
-手机浏览器 ──HTTPS──> relay-server ──WS(JSON 帧)──> dsh-pocketrelay 桌面插件 ──HTTP/WS──> 本地 dsh web
+手机浏览器 ──HTTPS──> relay-server ──WS(data-req/data-res)──> dsh-pocketrelay 桌面插件 ──注入 apiProxy/fs──> DSH 宿主能力
 ```
 
 ## 运行
@@ -32,8 +32,8 @@ sudo DSH_POCKETRELAY_HOST_TOKEN=<强随机串> \
 ## 手机配对流程（v1 简化）
 
 1. 桌面插件以 hostToken 注册 → relay 签发 6 位配对码（推给桌面展示）。
-2. 手机访问 `<relay>/pair`，输入 6 位码 → relay 校验（code 作一次性密钥，60s 有效）→ 下发 HttpOnly 会话 cookie + 重定向到 `/d/<deviceId>/`。
-3. 之后手机的 `/d/<deviceId>/*` 请求凭 cookie 反代到桌面端本地 dsh web（流式，支持 SSE）；`/d/<deviceId>/events/*` 的 WS upgrade 桥接到本地 dsh 事件流。
+2. 手机访问 `<relay>/pair`，输入 6 位码 → relay 校验（code 作一次性密钥，60s 有效）→ 下发 HttpOnly 会话 cookie + 重定向到 `/`。
+3. 之后手机凭 cookie 在 `/` 打开 relay 自有的移动 UI；UI 调用的 `/api/*`（会话列表/历史、发消息、工作目录文件读写）被 relay 翻译为 data-req 数据帧发给桌面插件，插件经注入的 apiProxy/fs 能力应答（data-res）。host 离线时 `/api/*` 返回 503。
 
 > v1 用 code 作一次性密钥（Set-Cookie 在 /pair HTTP 响应下发，浏览器原生支持）；
 > 完整协议（`docs/PROTOCOL.md` §4 的 HMAC-SHA256 WS 挑战）为后续增强，当前实现与之等价安全语义。

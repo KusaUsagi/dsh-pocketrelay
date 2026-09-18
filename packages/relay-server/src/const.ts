@@ -42,6 +42,8 @@ export const CHALLENGE_TTL_MS = 60_000
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** 管理台会话有效期（12 小时）。 */
 export const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
+/** /api 数据请求等待 host 数据响应的超时（30s）。 */
+export const DATA_REQ_TIMEOUT_MS = 30_000
 
 /** 手机会话 cookie 名。 */
 export const SESSION_COOKIE = "dsh-pocketrelay"

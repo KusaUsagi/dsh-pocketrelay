@@ -3,9 +3,10 @@
  *
  * 唯一把 untrusted wire JSON 收敛为 typed {@link Frame} 的地方：WS 负载是
  * `unknown`，{@link parseFrame} 按 protocol 的判别联合收窄。relay 同时收发
- * host 与 phone 两端，因此解析所有 24 种帧（host→relay 的响应面帧也在此解析）。
+ * host 与 phone 两端，因此解析所有入站帧（host→relay 的 data-res 响应面帧也在此解析）。
  */
 import {
+  type DataReqKind,
   type Frame,
   type HelloDenyReason,
   type HttpMethod,
@@ -80,6 +81,19 @@ function readOpcode(value: unknown): 1 | 2 {
 
 function readRole(value: unknown): "host" | "phone" | null {
   return value === "host" || value === "phone" ? value : null
+}
+
+function readKind(value: unknown): DataReqKind | null {
+  switch (value) {
+    case "conversation":
+    case "file-list":
+    case "file-read":
+    case "file-write":
+    case "send-message":
+      return value
+    default:
+      return null
+  }
 }
 
 /**
@@ -191,6 +205,23 @@ export function parseFrame(raw: unknown): Frame | null {
       return reason === null
         ? { t, id, code: readNumber(raw["code"], 1000) }
         : { t, id, code: readNumber(raw["code"], 1000), reason }
+    }
+    case T.DATA_RES: {
+      const kind = readKind(raw["kind"])
+      if (kind === null) return null
+      const ok = raw["ok"] === true
+      const error = readNullableString(raw["error"])
+      const frame: {
+        t: "data-res"
+        id: number
+        kind: DataReqKind
+        ok: boolean
+        data?: unknown
+        error?: string
+      } = { t: "data-res", id, kind, ok }
+      if (error !== null) frame.error = error
+      if (Object.hasOwn(raw, "data")) frame.data = raw["data"]
+      return frame
     }
     default:
       return null

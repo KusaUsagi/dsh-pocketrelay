@@ -1,9 +1,9 @@
 {
   "name": "@dsh-pocketrelay/relay-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Self-hosted relay for dsh-pocketrelay: pairing, HTTP/WS tunnel bridging, admin console.",
+  "description": "Self-hosted relay for dsh-pocketrelay: pairing, mobile UI + structured data plane, admin console.",
   "main": "./dist/index.js",
   "bin": {
     "dsh-pocketrelay-relay": "./dist/cli.js"

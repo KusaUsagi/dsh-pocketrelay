@@ -1,7 +1,7 @@
 {
   "name": "dsh-pocketrelay",
-  "version": "0.1.2",
-  "description": "Phone-browser remote access to DeepSeek Harness via a self-hosted relay (tunnel + mobile-adapted web UI).",
+  "version": "0.2.0",
+  "description": "Phone-browser remote access to DeepSeek Harness via a self-hosted relay (data-plane host plugin answering structured requests).",
   "type": "module",
   "main": "lib/index.js",
   "files": [

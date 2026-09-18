@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https"
 import type { AddressInfo } from "node:net"
+import { T } from "@dsh-pocketrelay/protocol"
 import {
   generateToken,
   hashAdminPassword,
@@ -14,10 +15,11 @@ import {
   ADMIN_SESSION_TTL_MS,
   DEFAULT_BIND,
   DEFAULT_PORT,
-  SESSION_COOKIE,
   defaultDataDir,
+  SESSION_COOKIE,
 } from "./const.js"
-import { HttpProxy } from "./http-proxy.js"
+import { DataApi } from "./data-api.js"
+import { mobileAppHtml } from "./mobile-page.js"
 import {
   type AdminDeviceView,
   adminDashboardHtml,
@@ -37,6 +39,7 @@ export interface RelayOptions {
   certPath?: string
   keyPath?: string
   adminPassword?: string
+  dataTimeoutMs?: number
   log?: (msg: string) => void
 }
 
@@ -60,49 +63,39 @@ export async function createRelay(opts: RelayOptions): Promise<RelayHandle> {
   const adminHash = hashAdminPassword(adminPassword)
   if (opts.adminPassword === undefined) log(`admin password generated (set --adminPassword to pin)`)
 
-  let proxy: HttpProxy | undefined
+  let dataApi: DataApi | undefined
   const wsBridge = new WsBridge({
     store,
     hostToken: opts.hostToken,
     log,
-    onHostFrame: (deviceId, frame) => proxy?.dispatch(deviceId, frame),
-    onHostOffline: (deviceId) => sessions.revokePhoneByDevice(deviceId),
+    onHostFrame: (deviceId, frame) => {
+      if (dataApi !== undefined && frame.t === T.DATA_RES) dataApi.handleDataRes(deviceId, frame)
+    },
+    onHostOffline: (deviceId) => {
+      // 数据面：host 离线只让在途 /api 请求 503；手机会话 cookie 保留，
+      // 下次 /api 因 sendToHost 返回 false 而 503，host 回来即可继续用，
+      // 无需重新配对（401 仅在 cookie 过期或 /admin 显式撤销时发生）。
+      dataApi?.failAllForDevice(deviceId)
+    },
   })
-  proxy = new HttpProxy({
+  dataApi = new DataApi({
     store,
     sessions,
     sendToHost: (id, frame) => wsBridge.sendToHost(id, frame),
     log,
+    ...(opts.dataTimeoutMs !== undefined ? { dataTimeoutMs: opts.dataTimeoutMs } : {}),
   })
 
   const tls = await loadOrCreateTls(dataDir, opts.certPath, opts.keyPath)
   const server: HttpsServer = createHttpsServer(
     { cert: tls.cert, key: tls.key },
-    (req, res) => void handleRequest(req, res, store, sessions, wsBridge, proxy, adminHash),
+    (req, res) => void handleRequest(req, res, store, sessions, wsBridge, dataApi, adminHash),
   )
 
   server.on("upgrade", (req, socket, head) => {
     const parts = pathParts(req.url ?? "/")
     if (parts[0] === "ws") {
       wsBridge.handleUpgrade(req, socket, head)
-      return
-    }
-    // /d/<deviceId>/events/* (显式) 或凭 session cookie 的 /events/* (dsh web 根相对 WS) → host WS 隧道
-    let deviceId: string | undefined
-    let rest: string | undefined
-    if (parts[0] === "d" && parts.length >= 2) {
-      deviceId = parts[1]
-      rest = "/" + parts.slice(2).join("/")
-    } else {
-      const sid = readCookie(req.headers.cookie, SESSION_COOKIE)
-      const session = sid !== null ? sessions.getPhone(sid) : null
-      if (session !== null) {
-        deviceId = session.deviceId
-        rest = new URL(req.url ?? "/", "http://relay").pathname
-      }
-    }
-    if (deviceId !== undefined && rest !== undefined) {
-      proxy?.handleEventsUpgrade(req, socket, head, deviceId, rest)
       return
     }
     socket.destroy()
@@ -122,7 +115,7 @@ export async function createRelay(opts: RelayOptions): Promise<RelayHandle> {
     adminPassword,
     close: async () => {
       wsBridge.close()
-      proxy?.close()
+      dataApi?.close()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }
@@ -136,17 +129,14 @@ async function handleRequest(
   store: RelayStore,
   sessions: SessionRegistry,
   wsBridge: WsBridge,
-  proxy: HttpProxy | undefined,
+  dataApi: DataApi | undefined,
   adminHash: string,
 ): Promise<void> {
   const parts = pathParts(req.url ?? "/")
-  // 凭 session cookie 转发:已配对手机的根相对请求(/,/assets/,/api/,/events/...)都走隧道到 host
   const phoneSid = readCookie(req.headers.cookie, SESSION_COOKIE)
   const phoneSession = phoneSid !== null ? sessions.getPhone(phoneSid) : null
   if (parts.length === 0) {
-    if (phoneSession !== null && proxy !== undefined) {
-      return proxy.handleHttpRequest(req, res, phoneSession.deviceId, "/")
-    }
+    if (phoneSession !== null) return html(res, mobileAppHtml())
     return html(res, landingPage())
   }
   switch (parts[0]) {
@@ -160,18 +150,12 @@ async function handleRequest(
       res.setHeader("content-type", "application/manifest+json")
       res.end(MANIFEST)
       return
-    case "d": {
-      if (parts.length < 2) return notFound(res)
-      if (proxy === undefined) return notFound(res)
-      const deviceId = parts[1]
-      if (deviceId === undefined) return notFound(res)
-      return proxy.handleHttpRequest(req, res, deviceId, "/" + parts.slice(2).join("/"))
+    case "api": {
+      if (phoneSession === null) return json(res, 401, { ok: false, error: "unauthorized" })
+      if (dataApi === undefined) return json(res, 503, { ok: false, error: "relay not ready" })
+      return dataApi.handleApiRequest(req, res, phoneSession)
     }
     default:
-      if (phoneSession !== null && proxy !== undefined) {
-        const fullpath = new URL(req.url ?? "/", "http://relay").pathname
-        return proxy.handleHttpRequest(req, res, phoneSession.deviceId, fullpath)
-      }
       return notFound(res)
   }
 }
@@ -317,7 +301,7 @@ async function readForm(req: IncomingMessage): Promise<Map<string, string>> {
 const MANIFEST = JSON.stringify({
   name: "dsh-pocketrelay",
   short_name: "dsh-relay",
-  start_url: "/pair",
+  start_url: "/",
   display: "standalone",
   background_color: "#111111",
   theme_color: "#111111",

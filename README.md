@@ -1,12 +1,12 @@
 # dsh-pocketrelay
 
-手机浏览器经自托管中继远程访问 DeepSeek Harness(DSH)桌面端 Web UI 的隧道方案。
+手机浏览器经自托管中继远程使用 DeepSeek Harness(DSH)桌面端能力的隧道方案:relay 自有移动 UI + 结构化数据面。
 
-- **relay-server**:部署在公网 VPS(腾讯云,公网 IP + 自签证书)上的 Node 服务。配对鉴权、HTTP/WS 反向代理、管理台。
-- **dsh-pocketrelay**(DSH 插件):运行在 PC 的 `dsh --profile web` 内,启动后出站注册到 relay,把手机流量桥接到本地 `127.0.0.1:<dshWebPort>`,并注入移动适配层。
+- **relay-server**:部署在公网 VPS(腾讯云,公网 IP + 自签证书)上的 Node 服务。配对鉴权、移动 UI 与 /api 数据面、管理台。
+- **dsh-pocketrelay**(DSH 插件):运行在 PC 的 `dsh --profile web` 内,启动后出站注册到 relay,经注入的 apiProxy/fs 能力应答 relay 的 data-req 数据帧。
 
 ```
-手机浏览器 ──HTTPS──> relay-server ──WS(JSON 帧)──> dsh-pocketrelay 插件 ──HTTP/WS──> 本地 dsh web
+手机浏览器 ──HTTPS──> relay-server(移动 UI + /api)──WS(data-req/data-res)──> dsh-pocketrelay 插件 ──apiProxy/fs──> DSH 宿主能力
 ```
 
 PC 用出站 WS 主动注册,无需在 PC 开入站端口/公网 IP;`HOST_TOKEN` 是 relay 与 host 间唯一信任边界,配对走 6 位码 + HMAC-SHA256 一次性挑战。完整协议见 [`docs/PROTOCOL.md`](./docs/PROTOCOL.md)。
@@ -54,7 +54,7 @@ dsh --profile web
 
 > 若你把项目推到别的 owner/repo(例如现有的 `dsh-workspace` 仓库),把上面 URL 的 `KusaUsagi/dsh-pocketrelay` 换成你的 `<owner>/<repo>` 即可。
 
-启动后在 DSH **设置 → 手机连接** 填 relay 地址(`https://<公网IP>:8443`)与 `HOST_TOKEN`,扫码或在 `<relay>/pair` 输入 6 位配对码,即可在手机上使用与桌面同源的 Web UI。
+启动后在 DSH **设置 → 手机连接** 填 relay 地址(`https://<公网IP>:8443`)与 `HOST_TOKEN`,扫码或在 `<relay>/pair` 输入 6 位配对码,配对成功后手机打开 `<relay>/` 即是 relay 自有的移动 UI,可远程会话与管理桌面端工作目录文件。
 
 ## 安全
 

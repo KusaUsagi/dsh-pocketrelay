@@ -3,7 +3,7 @@
  *
  * Owns the WebSocket link to the relay: `hello` registration, ping/pong
  * keepalive, exponential reconnect, and the status surface for the UI. Data
- * plane frames (http-* / ws-*) are not interpreted here — they are dispatched
+ * plane frames (data-*) are not interpreted here — they are dispatched
  * to {@link setFrameSink} so this class stays a pure control-plane client.
  * The relay socket is the Node 22+ global `WebSocket`.
  */
@@ -293,24 +293,27 @@ export class RelayAgent {
         return
       case T.PONG:
         return
-      case T.HTTP_REQ:
-      case T.HTTP_BODY:
-      case T.HTTP_BODY_END:
-      case T.HTTP_ABORT:
-      case T.WS_OPEN:
-      case T.WS_FRAME:
-      case T.WS_CLOSE:
+      case T.DATA_REQ:
         this.frameSink?.(frame)
         return
       case T.HELLO:
       case T.REVOKED:
+      case T.DATA_RES:
+      case T.HTTP_REQ:
+      case T.HTTP_BODY:
+      case T.HTTP_BODY_END:
+      case T.HTTP_ABORT:
       case T.HTTP_HEAD:
       case T.HTTP_CHUNK:
       case T.HTTP_END:
       case T.HTTP_ERR:
+      case T.WS_OPEN:
       case T.WS_OPEN_OK:
       case T.WS_OPEN_ERR:
-        // Outbound-only types the relay never sends to a host; ignore quietly.
+      case T.WS_FRAME:
+      case T.WS_CLOSE:
+        // Outbound-only or deleted-plane types the relay never sends to a host;
+        // ignore quietly.
         return
       default:
         assertNever(frame)

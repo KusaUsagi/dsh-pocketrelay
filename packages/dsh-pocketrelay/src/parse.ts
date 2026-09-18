@@ -5,34 +5,21 @@
  * payload is `unknown`, `parseFrame` narrows it against the protocol's
  * discriminated union (packages/protocol). Every interior module then receives
  * typed frames and never re-validates. The data-plane subset routed to the
- * http/ws planes is {@link DataPlaneFrame}; outbound-only frame types (which
- * the relay never sends to a host) parse to `null` and are ignored.
+ * data plane is {@link DataPlaneFrame}; outbound-only frame types (which the
+ * relay never sends to a host) parse to `null` and are ignored.
  */
 import {
   assertNever,
+  type DataReqFrame,
+  type DataReqKind,
   type Frame,
   type HelloDenyReason,
-  type HttpAbortFrame,
-  type HttpBodyEndFrame,
-  type HttpBodyFrame,
-  type HttpMethod,
-  type HttpReqFrame,
   type PeerState,
   T,
-  type WsCloseFrame,
-  type WsFrameFrame,
-  type WsOpenFrame,
 } from "@dsh-pocketrelay/protocol"
 
-/** Inbound data-plane frames dispatched from the agent to a plane. */
-export type DataPlaneFrame =
-  | HttpReqFrame
-  | HttpBodyFrame
-  | HttpBodyEndFrame
-  | HttpAbortFrame
-  | WsOpenFrame
-  | WsFrameFrame
-  | WsCloseFrame
+/** Inbound data-plane frames dispatched from the agent to the data plane. */
+export type DataPlaneFrame = DataReqFrame
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -48,15 +35,6 @@ function readNullableString(value: unknown): string | null {
 
 function readNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback
-}
-
-function readStringMap(value: unknown): Record<string, string> | null {
-  if (!isRecord(value)) return null
-  const map: Record<string, string> = {}
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === "string") map[key] = entry
-  }
-  return map
 }
 
 function readPair(value: unknown): { readonly code: string; readonly expiresAt: number } | null {
@@ -80,23 +58,17 @@ function readDenyReason(value: unknown): HelloDenyReason {
   return "UNKNOWN_DEVICE"
 }
 
-function readHttpMethod(value: unknown): HttpMethod {
+function readKind(value: unknown): DataReqKind | null {
   switch (value) {
-    case "GET":
-    case "POST":
-    case "PUT":
-    case "PATCH":
-    case "DELETE":
-    case "HEAD":
-    case "OPTIONS":
+    case "conversation":
+    case "file-list":
+    case "file-read":
+    case "file-write":
+    case "send-message":
       return value
     default:
-      return "GET"
+      return null
   }
-}
-
-function readOpcode(value: unknown): 1 | 2 {
-  return value === 2 ? 2 : 1
 }
 
 /**
@@ -136,31 +108,24 @@ export function parseFrame(raw: unknown): Frame | null {
       return { t }
     case T.PONG:
       return { t }
-    case T.HTTP_REQ:
-      return {
-        t,
-        id,
-        method: readHttpMethod(raw["method"]),
-        path: readString(raw["path"], "/"),
-        query: readString(raw["query"]),
-        headers: readStringMap(raw["headers"]),
-        bodyBase64: readNullableString(raw["bodyBase64"]),
-      }
-    case T.HTTP_BODY:
-      return { t, id, dataBase64: readString(raw["dataBase64"]) }
-    case T.HTTP_BODY_END:
-      return { t, id }
-    case T.HTTP_ABORT:
-      return { t, id }
-    case T.WS_OPEN:
-      return { t, id, path: readString(raw["path"], "/"), headers: readStringMap(raw["headers"]) }
-    case T.WS_FRAME:
-      return { t, id, opcode: readOpcode(raw["opcode"]), dataBase64: readString(raw["dataBase64"]) }
-    case T.WS_CLOSE: {
-      const reason = readNullableString(raw["reason"])
-      return reason === null
-        ? { t, id, code: readNumber(raw["code"], 1000) }
-        : { t, id, code: readNumber(raw["code"], 1000), reason }
+    case T.DATA_REQ: {
+      const kind = readKind(raw["kind"])
+      if (kind === null) return null
+      const path = readNullableString(raw["path"])
+      const content = readNullableString(raw["content"])
+      const sessionId = readNullableString(raw["sessionId"])
+      const frame: {
+        t: "data-req"
+        id: number
+        kind: DataReqKind
+        path?: string
+        content?: string
+        sessionId?: string
+      } = { t: "data-req", id, kind }
+      if (path !== null) frame.path = path
+      if (content !== null) frame.content = content
+      if (sessionId !== null) frame.sessionId = sessionId
+      return frame
     }
     default:
       return null

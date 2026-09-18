@@ -1,13 +1,14 @@
 # dsh-pocketrelay
 
-DeepSeek Harness（DSH）桌面插件的手机远程连接方案：自托管中继 + 隧道桥接 + 移动适配。
+DeepSeek Harness（DSH）桌面插件的手机远程连接方案：自托管中继 + 结构化数据面。
 
-运行在 `dsh --profile web` 内，出站注册到自托管 relay，把手机浏览器流量桥接到本地
-`127.0.0.1:<webServer.port>`，并为隧道内流量注入移动适配层（满宽聊天、全屏设置面板、
-侧栏抽屉、`interactive-widget=resizes-content` 视口）。
+运行在 `dsh --profile web` 内，出站注册到自托管 relay，应答 relay 发来的 data-req
+数据帧：经 `ctx.inject(["apiProxy", "fs"])` 注入的能力处理会话与文件请求（apiProxy
+管会话与宿主信息，fs 管工作目录文件），结果以 data-res 帧返回。SDK 形状未最终确认，
+运行时探测，能力缺失即回 `ok:false`。webServer 注入保留，仅服务控制面的设置页。
 
 ```
-手机浏览器 ──HTTPS──> relay-server ──WS(JSON 帧)──> dsh-pocketrelay ──HTTP/WS──> 本地 dsh web
+手机浏览器 ──HTTPS──> relay-server ──WS(data-req/data-res)──> dsh-pocketrelay ──ctx.apiProxy / ctx.fs──> DSH 宿主能力
 ```
 
 PC 出站 WS 主动注册，无需入站端口/公网 IP；`HOST_TOKEN` 是 relay 与 host 间唯一信任边界，
@@ -35,7 +36,7 @@ dsh plugin --profile web add ../dsh-pocketrelay-0.1.0.tgz
 
 1. 填写中继地址（`https://<公网IP>:8443`）与 `HOST_TOKEN`；
 2. 连接成功后页面显示 6 位配对码；
-3. 手机访问 `<relay>/pair`（或直接打开配对页链接）输入配对码。
+3. 手机访问 `<relay>/pair`（或直接打开配对页链接）输入配对码，配对成功即在 `<relay>/` 打开移动 UI。
 
 运行时配置持久化于 `<dshHome>/storages/dsh-pocketrelay/config.json`（原子写：`.tmp` 后
 rename），覆盖 `cordis.patch.yml` 的默认值。设备标识 `identity.json`（32-hex）同目录持久化。
@@ -44,8 +45,8 @@ rename），覆盖 `cordis.patch.yml` 的默认值。设备标识 `identity.json
 
 - relay 必须置于 TLS 之后；`HOST_TOKEN` 是唯一信任边界，插件日志永不打印 token/配对码明文。
 - 配对走一次性 HMAC 挑战；relay 落盘只存 `sha256`。
-- 手机会话 cookie（授权凭据）由 `connection.browserAuth` 在进程内为 loopback authority 铸造，
-  凭据不离开桌面进程；旧版 harness 无此服务时自动退化为透传。
+- 手机会话 cookie 由 relay 签发（HttpOnly）；插件只认 `HOST_TOKEN` 那条 WS，
+  不参与手机侧鉴权，只见 relay 翻译后的 data-req 帧。
 
 ## License
 

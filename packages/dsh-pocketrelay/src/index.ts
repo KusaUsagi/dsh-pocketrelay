@@ -93,13 +93,16 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
 }
 
 /**
- * Probe how dsh exposes apiProxy/fs — direct ctx property (`ctx.apiProxy`) vs
- * injectable service (`ctx.get("apiProxy")`) — and call setCaps immediately if
- * either path yields both caps as objects. Logs the probe result for diagnosis.
+ * Probe how dsh exposes apiProxy/fs — via `ctx.get(name)` (the cordis bypass
+ * lookup, usable without declaring inject; `dsh-remote` uses `webCtx.get('connection')`
+ * the same way). Direct `ctx.apiProxy`/`ctx.fs` reads THROW "cannot get property
+ * without inject" in cordis — services are only readable after inject — so we
+ * do NOT touch the direct properties here; the top-level `ctx.inject` below is
+ * the canonical path that makes them readable inside its callback. If `ctx.get`
+ * already returns both as objects (services loaded by apply time), setCaps now;
+ * otherwise the `ctx.inject` callback fires when they materialize.
  */
 function probeAndSet(ctx: Context, dataPlane: DataPlane, label: string): void {
-  const apProp = ctx.apiProxy
-  const fpProp = ctx.fs
   let gAp: unknown
   let gFp: unknown
   try {
@@ -113,22 +116,10 @@ function probeAndSet(ctx: Context, dataPlane: DataPlane, label: string): void {
     // ignore
   }
   console.warn(
-    `[dsh-pocketrelay] probe(${label}): ctx.apiProxy=${typeof apProp} ctx.fs=${typeof fpProp} get('apiProxy')=${gAp === undefined ? "undefined" : typeof gAp} get('fs')=${gFp === undefined ? "undefined" : typeof gFp}`,
+    `[dsh-pocketrelay] probe(${label}): get('apiProxy')=${gAp === undefined ? "undefined" : typeof gAp} get('fs')=${gFp === undefined ? "undefined" : typeof gFp}`,
   )
-  const capAp =
-    typeof apProp === "object" && apProp !== null
-      ? apProp
-      : typeof gAp === "object" && gAp !== null
-        ? gAp
-        : undefined
-  const capFp =
-    typeof fpProp === "object" && fpProp !== null
-      ? fpProp
-      : typeof gFp === "object" && gFp !== null
-        ? gFp
-        : undefined
-  if (capAp !== undefined && capFp !== undefined) {
-    console.warn(`[dsh-pocketrelay] probe(${label}): caps available — calling setCaps`)
-    dataPlane.setCaps(capAp, capFp)
+  if (typeof gAp === "object" && gAp !== null && typeof gFp === "object" && gFp !== null) {
+    console.warn(`[dsh-pocketrelay] probe(${label}): caps available via ctx.get — calling setCaps`)
+    dataPlane.setCaps(gAp, gFp)
   }
 }

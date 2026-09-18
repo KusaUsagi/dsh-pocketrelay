@@ -1,13 +1,6 @@
 # dsh-pocketrelay — 手机远程连接
 # 运行时配置可由 设置 → 手机连接 页覆盖（持久化于 storages/dsh-pocketrelay/config.json）。
-# Insert the api-gateway bundle row so ctx.apiProxy is available (provides
-# sessions.list/history/prompt + host.describe). The stock web-app bundle should
-# have it but some dsh versions ship without it; this insert ensures it loads
-# if the package is installed (it's a dep of @deepseek-ai/dsh-web-app, which the
-# web profile already mounts).
 - insert:
-    - id: api-gateway
-      name: '@deepseek-ai/dsh-host-apiproxy'
     - id: dsh-pocketrelay
       name: dsh-pocketrelay
       config:

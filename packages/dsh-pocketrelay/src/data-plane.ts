@@ -1,20 +1,20 @@
 /**
  * dsh-pocketrelay — structured data plane, host side.
  *
- * The relay's `data-req` frames become direct calls into injected DSH SDK
- * services: `ctx.apiProxy` (sessions.list/history/prompt, host.describe) and
- * `ctx.fs` (resolve/listDir/readText/writeText). apiProxy is loaded via the
- * `api-gateway` bundle row inserted by this plugin's cordis.patch.yml (the
- * stock web-app bundle should have it, but some dsh versions ship without it;
- * the insert ensures ctx.apiProxy is available). The SDK shapes are probed at
- * runtime and degrade to `ok:false` per-kind: a missing service fails only its
- * own ops (no apiProxy → conversation ops fail, but file ops still work via
- * fs). `handle` is fire-and-forget; every frame is answered exactly once.
+ * The relay's `data-req` frames are answered two ways:
+ *  - Conversation ops (sessions list/history/prompt): the plugin FETCHES the
+ *    local dsh web HTTP API (`POST http://127.0.0.1:<webServer.port>/api/<method>`).
+ *    The dsh web's /api/* handler (owned by the connection plugin) runs in a
+ *    scope where ctx.apiProxy IS defined (the web UI uses it), so loopback
+ *    fetches pass the trust fence (Host: 127.0.0.1) and reach the high-level
+ *    conversation gateway — no apiProxy needed in THIS plugin's scope.
+ *  - File ops (list/read/write): direct calls into `ctx.fs` (resolve/listDir/
+ *    readText/writeText) with method-call syntax to preserve `this`.
  *
- * IMPORTANT: service methods are PROTOTYPE methods that read `this.*` internally
- * — invoke with method-call syntax (`apiProxy.sessions.list({})`, `fs.resolve(p)`)
- * to preserve `this`; detaching (`const m = obj.method; m(...)`) loses `this`
- * and throws "Cannot read properties of undefined (reading 'store')".
+ * The dsh web HTTP API envelope (per harness source):
+ *   request  = { type:'client-request', rpcId, method, payload }
+ *   response = { type:'server-response', rpcId, result:{ok:true,value} | {ok:false,error} }
+ * Methods: session.list, session.history, session.prompt.
  */
 import {
   assertNever,
@@ -27,18 +27,6 @@ import {
 /** 1 MiB serialized ceiling for a `data-res` frame (string length, not bytes). */
 const MAX_PAYLOAD_CHARS = 1048576
 
-interface SessionsCap {
-  list?: (args: unknown) => Promise<unknown>
-  history?: (args: unknown) => Promise<unknown>
-  prompt?: (args: unknown) => Promise<unknown>
-}
-interface HostCap {
-  describe?: (args: unknown) => Promise<unknown>
-}
-interface ApiProxyCap {
-  sessions?: SessionsCap
-  host?: HostCap
-}
 interface FsCap {
   resolve?: (path: unknown) => unknown
   listDir?: (path: unknown) => Promise<unknown>
@@ -55,6 +43,10 @@ interface MutableDataRes {
   error?: string
 }
 
+interface ApiResponse {
+  result?: { ok?: boolean; value?: unknown; error?: { message?: string; code?: string } }
+}
+
 export interface DataPlaneOptions {
   log: (message: string) => void
   send: (frame: DataResFrame) => void
@@ -68,13 +60,13 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** Describe a cap: own keys + ALL function names walking the full proto chain. */
-function describeCap(label: string, cap: unknown): string {
-  if (typeof cap !== "object" || cap === null) return `${label}=UNDEFINED`
-  const own = Object.keys(cap)
+/** Describe the fs cap: own keys + ALL function names walking the proto chain. */
+function describeFs(fs: unknown): string {
+  if (typeof fs !== "object" || fs === null) return "UNDEFINED"
+  const own = Object.keys(fs)
   const fns = new Set<string>()
-  const rec = cap as Record<string, unknown>
-  let p: object | null = Object.getPrototypeOf(cap)
+  const rec = fs as Record<string, unknown>
+  let p: object | null = Object.getPrototypeOf(fs)
   let depth = 0
   while (p !== null && p !== Object.prototype && depth < 6) {
     try {
@@ -87,22 +79,27 @@ function describeCap(label: string, cap: unknown): string {
     p = Object.getPrototypeOf(p)
     depth += 1
   }
-  return `${label}=own{${own.join(",")}} fns{${[...fns].slice(0, 40).join(",")}}`
+  return `own{${own.join(",")}} fns{${[...fns].slice(0, 40).join(",")}}`
 }
 
 export class DataPlane {
-  private apiProxy: ApiProxyCap | undefined = undefined
   private fs: FsCap | undefined = undefined
+  private origin: string | undefined = undefined
 
   constructor(private readonly options: DataPlaneOptions) {}
 
-  /** Set the apiProxy + fs caps (from ctx.get or ctx.inject). */
-  setCaps(apiProxy: unknown, fs: unknown): void {
-    this.apiProxy =
-      typeof apiProxy === "object" && apiProxy !== null ? (apiProxy as ApiProxyCap) : undefined
+  /** Set the fs cap (from ctx.get("fs") or ctx.inject(["fs"])). */
+  setFs(fs: unknown): void {
     this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
-    console.warn(`[dsh-pocketrelay/data] ${describeCap("setCaps.apiProxy", this.apiProxy)}`)
-    console.warn(`[dsh-pocketrelay/data] ${describeCap("setCaps.fs", this.fs)}`)
+    console.warn(
+      `[dsh-pocketrelay/data] setFs: ${this.fs === undefined ? "UNDEFINED" : describeFs(this.fs)}`,
+    )
+  }
+
+  /** Set the dsh web origin for HTTP API calls (http://127.0.0.1:<webServer.port>). */
+  setOrigin(origin: string): void {
+    this.origin = origin
+    console.warn(`[dsh-pocketrelay/data] setOrigin: ${origin}`)
   }
 
   handle(frame: DataReqFrame): void {
@@ -113,7 +110,7 @@ export class DataPlane {
   }
 
   private async run(frame: DataReqFrame): Promise<void> {
-    // Per-kind: conversation ops need apiProxy; file ops need fs.
+    // Per-kind: conversation ops need the web origin (HTTP API); file ops need fs.
     try {
       switch (frame.kind) {
         case "conversation":
@@ -139,60 +136,49 @@ export class DataPlane {
     }
   }
 
-  private async conversation(frame: DataReqFrame): Promise<void> {
-    const apiProxy = this.apiProxy
-    if (apiProxy === undefined) {
-      this.respond(
-        frame,
-        false,
-        undefined,
-        "apiProxy unavailable (api-gateway bundle row not loaded)",
-      )
-      return
+  /** POST to the dsh web /api/<method> with the client-request envelope; returns
+   *  result.value on ok:true, throws on ok:false / HTTP error. Loopback Host
+   *  passes the trust fence; no token needed. */
+  private async apiCall(method: string, payload: unknown): Promise<unknown> {
+    if (this.origin === undefined) throw new Error("webServer origin not set")
+    const rpcId = Math.random().toString(36).slice(2, 12)
+    const res = await fetch(`${this.origin}/api/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "client-request", rpcId, method, payload }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+    const body = (await res.json()) as ApiResponse
+    if (body?.result?.ok !== true) {
+      throw new Error(body?.result?.error?.message ?? body?.result?.error?.code ?? "api error")
     }
-    // Method-call syntax preserves `this`.
+    return body.result.value
+  }
+
+  private async conversation(frame: DataReqFrame): Promise<void> {
     if (frame.sessionId !== undefined) {
-      if (typeof apiProxy.sessions?.history !== "function") {
-        this.respond(frame, false, undefined, "apiProxy.sessions.history unavailable")
-        return
-      }
-      const data = await apiProxy.sessions.history({ sessionId: frame.sessionId, maxMessages: 200 })
+      const data = await this.apiCall("session.history", {
+        sessionId: frame.sessionId,
+        maxMessages: 200,
+      })
       this.respondData(frame, data)
       return
     }
-    if (typeof apiProxy.sessions?.list !== "function") {
-      this.respond(frame, false, undefined, "apiProxy.sessions.list unavailable")
-      return
-    }
-    const data = await apiProxy.sessions.list({})
+    const data = await this.apiCall("session.list", { cursor: "" })
     this.respondData(frame, data)
   }
 
   private async sendMessage(frame: DataReqFrame): Promise<void> {
-    const apiProxy = this.apiProxy
-    if (apiProxy === undefined) {
-      this.respond(
-        frame,
-        false,
-        undefined,
-        "apiProxy unavailable (api-gateway bundle row not loaded)",
-      )
-      return
-    }
     const sessionId = frame.sessionId
     const content = frame.content
     if (sessionId === undefined || content === undefined) {
       this.respond(frame, false, undefined, "sessionId and content required")
       return
     }
-    if (typeof apiProxy.sessions?.prompt !== "function") {
-      this.respond(frame, false, undefined, "apiProxy.sessions.prompt unavailable")
-      return
-    }
-    const data = await apiProxy.sessions.prompt({
+    const data = await this.apiCall("session.prompt", {
       sessionId,
-      content: [{ type: "text", text: content }],
       mode: "queue",
+      content: [{ type: "text", text: content }],
     })
     this.respondData(frame, data)
   }
@@ -211,8 +197,7 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
-    // No path → resolve "." (the workspace cwd target). resolve takes a string
-    // path and returns an FsTarget (confirmed); method-call preserves this.
+    // No path → resolve "." (workspace cwd). resolve takes a string, returns FsTarget.
     const target = fs.resolve(frame.path ?? ".")
     const data = await fs.listDir(target)
     this.respondData(frame, data)

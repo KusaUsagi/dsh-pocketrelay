@@ -281,17 +281,24 @@ export class DataPlane {
       // joins with `/`, see dsh-api-gateway/lib/index.js:990). `throughSeq:-1`
       // is the documented "no upper bound" sentinel; `address.kind:"session"`
       // is the only branch this plugin addresses (no subagent remoting).
+      // The parameter wire field is `request` (per typert.host.js:970-978),
+      // so business params go under args.request, not at args top level.
       const data = await this.apiCall("session/page", {
-        address: { kind: "session", sessionId: frame.sessionId },
-        throughSeq: -1,
-        maxMessages: 200,
+        request: {
+          address: { kind: "session", sessionId: frame.sessionId },
+          throughSeq: -1,
+          maxMessages: 200,
+        },
       })
       this.respondData(frame, data)
       return
     }
-    // session/list: returns { items: [...] }. cursor is optional; omitting it
-    // starts at the newest. Use "" explicitly so the schema gets a string.
-    const data = await this.apiCall("session/list", { cursor: "" })
+    // session/list: returns { items: [...] }. The parameter wire field is
+    // `_request` (typert.host.js:903-904 — list takes a reserved empty
+    // request), so the cursor goes under args._request, not at args top
+    // level. cursor is optional; "" is a valid empty-string cursor that
+    // starts at the newest page (schema is z.string().optional()).
+    const data = await this.apiCall("session/list", { _request: { cursor: "" } })
     this.respondData(frame, data)
   }
 
@@ -306,11 +313,15 @@ export class DataPlane {
     // schema in dsh-api-session-controller/lib/typert.host.js:573-590). It is
     // the host-side idempotency/correlation key for this prompt; generate a
     // short random id (same shape as apiCall's rpcId, scoped to prompts).
+    // The parameter wire field is `request` (typert.host.js:996-997), so the
+    // business params go under args.request.
     const data = await this.apiCall("session/prompt", {
-      requestId: Math.random().toString(36).slice(2, 12),
-      sessionId,
-      mode: "queue",
-      content: [{ type: "text", text: content }],
+      request: {
+        requestId: Math.random().toString(36).slice(2, 12),
+        sessionId,
+        mode: "queue",
+        content: [{ type: "text", text: content }],
+      },
     })
     this.respondData(frame, data)
   }

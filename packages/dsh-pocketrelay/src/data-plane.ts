@@ -39,8 +39,12 @@ import {
   T,
 } from "@dsh-pocketrelay/protocol"
 
-/** 1 MiB serialized ceiling for a `data-res` frame (string length, not bytes). */
-const MAX_PAYLOAD_CHARS = 1048576
+/** 4 MiB serialized ceiling for a `data-res` frame (string length, not bytes).
+ *  WS can carry larger frames, but the phone JSON.parse path degrades on very
+ *  large payloads. 4 MiB covers a full 50-message history page including tool
+ *  results and long content blocks; if a session exceeds this, paginate via
+ *  beforeSeq instead of raising the limit further. */
+const MAX_PAYLOAD_CHARS = 4194304
 
 /** Workspace cwd used as the base for every fs.resolve call.
  *  dsh-fs-local's LocalFileSystem.config.cwd defaults to process.cwd() —
@@ -351,7 +355,11 @@ export class DataPlane {
         request: {
           address: { kind: "session", sessionId: frame.sessionId },
           throughSeq: asOfSeq,
-          maxMessages: 200,
+          // dsh's DEFAULT_MAX_MESSAGES is 50 (dsh-api-session-controller/lib/
+          // index.js:1328). 50 messages + their tool results fit comfortably
+          // under MAX_PAYLOAD_CHARS (4 MiB). Larger pages risk payload-too-
+          // large; paginate via beforeSeq for older history instead.
+          maxMessages: 50,
         },
       })
       this.respondData(frame, data)

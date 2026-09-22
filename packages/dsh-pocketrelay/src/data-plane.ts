@@ -320,15 +320,37 @@ export class DataPlane {
     if (frame.sessionId !== undefined) {
       // session/page: read one message-aligned history page. The endpoint is
       // `namespace/method` (slash, not dot — dsh typert gateway's endpointOf
-      // joins with `/`, see dsh-api-gateway/lib/index.js:990). `throughSeq:-1`
-      // is the documented "no upper bound" sentinel; `address.kind:"session"`
-      // is the only branch this plugin addresses (no subagent remoting).
-      // The parameter wire field is `request` (per typert.host.js:970-978),
-      // so business params go under args.request, not at args top level.
+      // joins with `/`, see dsh-api-gateway/lib/index.js:990). `address.kind:
+      // "session"` is the only branch this plugin addresses (no subagent
+      // remoting). The parameter wire field is `request` (per typert.host.js:
+      // 970-978), so business params go under args.request.
+      //
+      // throughSeq MUST be the session's last event seq (paginate uses
+      // throughSeq+1 as the exclusive end index; -1 yields end=0 → empty
+      // slice → "会话内容是空的"). We don't know the seq without reading, so
+      // first call session/list to fetch projections.asOfSeq for this session
+      // (typert.host.js:422 — projections.asOfSeq is the durable last seq).
+      // Costs one extra session/list round-trip per history read; acceptable
+      // for the mobile UI (list payload is session metadata, not messages).
+      const listResult = (await this.apiCall("session/list", { _request: { cursor: "" } })) as
+        | { items?: Array<{ sessionId?: string; projections?: { asOfSeq?: number } }> }
+        | undefined
+      const items = listResult?.items ?? []
+      const item = items.find((it) => it?.sessionId === frame.sessionId)
+      const asOfSeq = item?.projections?.asOfSeq
+      if (typeof asOfSeq !== "number") {
+        this.respond(
+          frame,
+          false,
+          undefined,
+          `session ${frame.sessionId} not found in list or has no projections.asOfSeq`,
+        )
+        return
+      }
       const data = await this.apiCall("session/page", {
         request: {
           address: { kind: "session", sessionId: frame.sessionId },
-          throughSeq: -1,
+          throughSeq: asOfSeq,
           maxMessages: 200,
         },
       })

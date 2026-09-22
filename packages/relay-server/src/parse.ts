@@ -86,6 +86,9 @@ function readRole(value: unknown): "host" | "phone" | null {
 function readKind(value: unknown): DataReqKind | null {
   switch (value) {
     case "conversation":
+    case "conversation-create":
+    case "conversation-pending":
+    case "conversation-respond":
     case "file-list":
     case "file-read":
     case "file-write":

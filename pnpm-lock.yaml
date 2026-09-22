@@ -26,6 +26,13 @@ importers:
       '@dsh-pocketrelay/protocol':
         specifier: workspace:*
         version: link:../protocol
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.5.0
+        version: 8.18.1
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.3
 
   packages/protocol: {}
 

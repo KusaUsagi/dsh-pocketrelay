@@ -33,6 +33,8 @@ interface DataReqSpec {
   readonly path?: string
   readonly content?: string
   readonly sessionId?: string
+  readonly workspaceId?: string
+  readonly eventId?: string
 }
 
 export interface DataApiOptions {
@@ -90,6 +92,39 @@ export class DataApi {
       return sessionId === null
         ? this.mint(res, deviceId, { kind: "conversation" })
         : this.mint(res, deviceId, { kind: "conversation", sessionId })
+    }
+    if (method === "POST" && path === "/api/session/create") {
+      // 新建会话：body { workspaceId } → host 调 session/create 把会话挂到指定工作区。
+      // workspaceId 必填（与 dsh-client-ui-workspace 的 connectWorkspace → sessions.create
+      // 一致：始终带 workspaceId，不带 cwd），host 侧 dsh-api-session-controller 拒绝
+      // workspaceId 与 cwd 同时出现，故本帧只透传 workspaceId。
+      const body = await readJsonBody(req)
+      const workspaceId = body?.["workspaceId"]
+      if (typeof workspaceId !== "string" || workspaceId === "")
+        return fail(res, 400, "workspaceId required")
+      return this.mint(res, deviceId, { kind: "conversation-create", workspaceId })
+    }
+    if (method === "GET" && path === "/api/session/pending") {
+      // 查询待回答问题：host 维持到 /api/remote.mux 的 $events WS 流，缓存所有
+      // pending waterfall 帧（user-questions/request + approval/request）。手机
+      // 轮询此端点获取 sessionId 对应的 pending 列表，渲染内联问答卡片。
+      const sessionId = qs.get("sessionId")
+      if (sessionId === null) return fail(res, 400, "sessionId required")
+      return this.mint(res, deviceId, { kind: "conversation-pending", sessionId })
+    }
+    if (method === "POST" && path === "/api/session/respond") {
+      // 回答 pending 问题：body { eventId, response } → host 查 pending Map 取
+      // clientId，调 POST /api/$events/result 回送 outcome:{kind:'result',value}。
+      const body = await readJsonBody(req)
+      const eventId = body?.["eventId"]
+      const response = body?.["response"]
+      if (typeof eventId !== "string" || eventId === "") return fail(res, 400, "eventId required")
+      if (response === undefined || response === null) return fail(res, 400, "response required")
+      return this.mint(res, deviceId, {
+        kind: "conversation-respond",
+        eventId,
+        content: JSON.stringify(response),
+      })
     }
     if (method === "POST" && path === "/api/message") {
       const body = await readJsonBody(req)
@@ -212,6 +247,8 @@ function buildDataReq(id: number, spec: DataReqSpec): DataReqFrame {
     ...(spec.path !== undefined ? { path: spec.path } : {}),
     ...(spec.content !== undefined ? { content: spec.content } : {}),
     ...(spec.sessionId !== undefined ? { sessionId: spec.sessionId } : {}),
+    ...(spec.workspaceId !== undefined ? { workspaceId: spec.workspaceId } : {}),
+    ...(spec.eventId !== undefined ? { eventId: spec.eventId } : {}),
   }
 }
 

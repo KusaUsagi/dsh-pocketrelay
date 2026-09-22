@@ -129,6 +129,7 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
       if (settings.autoConnect && settings.relayUrl.trim() !== "") agent.start()
       return () => {
         disposeRoutes()
+        dataPlane.dispose()
         agent.dispose()
       }
     }, "dsh-pocketrelay: host agent")

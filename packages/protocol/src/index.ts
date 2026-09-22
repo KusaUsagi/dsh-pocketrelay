@@ -202,6 +202,9 @@ export interface WsCloseFrame {
 /** relay→host：结构化数据请求（新数据面，取代 http/ws 反代）。 */
 export type DataReqKind =
   | "conversation"
+  | "conversation-create"
+  | "conversation-pending"
+  | "conversation-respond"
   | "file-list"
   | "file-read"
   | "file-write"
@@ -214,9 +217,17 @@ export interface DataReqFrame {
   readonly kind: DataReqKind
   /** file-read/file-write 的路径；send-message/conversation 的会话 id（可选，缺省取活动会话）。 */
   readonly path?: string
-  /** file-write 的内容；send-message 的用户消息文本。 */
+  /** file-write 的内容；send-message 的用户消息文本；conversation-respond 的 JSON-stringified 回答值。 */
   readonly content?: string
   readonly sessionId?: string
+  /** conversation-create：目标工作区 id（dsh WorkspaceRegistry 的 Workspace.id，
+   *  即 workspace-list 帧返回的 `id`）。host 调 session/create 时透传给
+   *  `args.request.workspaceId`，使新会话挂在该工作区下。 */
+  readonly workspaceId?: string
+  /** conversation-respond：待回答问题的 eventId（由 host 的 $events 流
+   *  waterfall 帧分配，经 conversation-pending 返回给手机）。host 据此查找
+   *  pending 项的 clientId，调 /api/$events/result 回送答案。 */
+  readonly eventId?: string
 }
 
 /** host→relay：结构化数据响应。data 形状按 kind 由 relay/host 约定（conversation=消息数组,file-list=目录项,file-read=文本,…）。 */

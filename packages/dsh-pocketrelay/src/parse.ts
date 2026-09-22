@@ -61,6 +61,9 @@ function readDenyReason(value: unknown): HelloDenyReason {
 function readKind(value: unknown): DataReqKind | null {
   switch (value) {
     case "conversation":
+    case "conversation-create":
+    case "conversation-pending":
+    case "conversation-respond":
     case "file-list":
     case "file-read":
     case "file-write":
@@ -115,6 +118,8 @@ export function parseFrame(raw: unknown): Frame | null {
       const path = readNullableString(raw["path"])
       const content = readNullableString(raw["content"])
       const sessionId = readNullableString(raw["sessionId"])
+      const workspaceId = readNullableString(raw["workspaceId"])
+      const eventId = readNullableString(raw["eventId"])
       const frame: {
         t: "data-req"
         id: number
@@ -122,10 +127,14 @@ export function parseFrame(raw: unknown): Frame | null {
         path?: string
         content?: string
         sessionId?: string
+        workspaceId?: string
+        eventId?: string
       } = { t: "data-req", id, kind }
       if (path !== null) frame.path = path
       if (content !== null) frame.content = content
       if (sessionId !== null) frame.sessionId = sessionId
+      if (workspaceId !== null) frame.workspaceId = workspaceId
+      if (eventId !== null) frame.eventId = eventId
       return frame
     }
     default:

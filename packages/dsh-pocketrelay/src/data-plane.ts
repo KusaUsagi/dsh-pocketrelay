@@ -30,7 +30,11 @@
  *                    sessionId}, throughSeq:-1, maxMessages?)
  *   session/prompt — admit one prompt (params: requestId, sessionId, mode,
  *                    content[])
+ *   session/create — create a new session bound to a workspace (params:
+ *                    workspaceId; returns { sessionId, agentPreset? })
  */
+
+import { randomUUID } from "node:crypto"
 import {
   assertNever,
   type DataReqFrame,
@@ -38,6 +42,7 @@ import {
   type DataResFrame,
   T,
 } from "@dsh-pocketrelay/protocol"
+import { WebSocket as WsClient } from "ws"
 
 /** 4 MiB serialized ceiling for a `data-res` frame (string length, not bytes).
  *  WS can carry larger frames, but the phone JSON.parse path degrades on very
@@ -140,6 +145,187 @@ function describeFs(fs: unknown): string {
   return `own{${own.join(",")}} fns{${[...fns].slice(0, 40).join(",")}}`
 }
 
+/** A pending user-question or approval interaction from the dsh web's $events
+ *  stream. Keyed by `eventId` in the RemoteEventsClient's pending Map. */
+interface PendingInteraction {
+  readonly eventId: string
+  /** "user-questions/request" | "approval/request" — the waterfall event name. */
+  readonly event: string
+  /** The request payload:
+   *  - user-questions/request: { questions: AskUserQuestionItem[] }
+   *  - approval/request: { toolName, callId?, reason? } */
+  readonly request: unknown
+}
+
+/** Maintains a persistent WS to the dsh web's `/api/remote.mux` subscribed to the
+ *  `$events` stream. The dsh web pushes `waterfall` frames for pending user
+ *  questions and tool approvals; without subscribing, these interactions are
+ *  invisible and the task hangs forever (the session log only records audit
+ *  events like `approval/asked` that don't carry the `eventId`/`clientId`
+ *  needed to answer).
+ *
+ *  The client stores pending interactions in memory and exposes them via the
+ *  `conversation-pending` data-req kind. Answers are sent back via
+ *  `conversation-respond` → POST `/api/$events/result` with the stored
+ *  clientId + eventId. On WS disconnect the pending Map is cleared; on
+ *  reconnect the dsh web replays still-pending waterfalls with the same
+ *  eventIds but a new clientId. */
+class RemoteEventsClient {
+  private ws: WsClient | null = null
+  private clientId: string | undefined = undefined
+  private readonly pending = new Map<string, PendingInteraction>()
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined = undefined
+  private closed = false
+  private cookie: string | undefined = undefined
+  private streamId: string = randomUUID()
+
+  constructor(
+    private readonly origin: string,
+    private readonly log: (message: string) => void,
+  ) {}
+
+  setCookie(cookie: string | undefined): void {
+    this.cookie = cookie
+  }
+
+  start(): void {
+    this.closed = false
+    this.connect()
+  }
+
+  stop(): void {
+    this.closed = true
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    if (this.ws !== null) {
+      try {
+        this.ws.close()
+      } catch {
+        // already closed
+      }
+      this.ws = null
+    }
+    this.pending.clear()
+    this.clientId = undefined
+  }
+
+  getPending(): PendingInteraction[] {
+    return [...this.pending.values()]
+  }
+
+  getClientId(): string | undefined {
+    return this.clientId
+  }
+
+  removePending(eventId: string): void {
+    this.pending.delete(eventId)
+  }
+
+  // --------------------------------------------------------------- internals
+
+  private connect(): void {
+    if (this.closed) return
+    if (this.cookie === undefined) {
+      // Cookie not minted yet; retry shortly (ensureCookie will setCookie
+      // which triggers the next connect via the 2s retry).
+      this.scheduleReconnect(2000)
+      return
+    }
+    const wsUrl = this.origin.replace(/^http/, "ws") + "/api/remote.mux"
+    this.streamId = randomUUID()
+    const headers: Record<string, string> = { Cookie: this.cookie }
+    let ws: WsClient
+    try {
+      ws = new WsClient(wsUrl, { headers })
+    } catch (error) {
+      this.log(`remote.mux connect failed: ${errorMessage(error)}`)
+      this.scheduleReconnect(2000)
+      return
+    }
+    this.ws = ws
+    ws.on("open", () => {
+      this.log("remote.mux connected; sending $events open")
+      ws.send(
+        JSON.stringify({
+          type: "open",
+          streamId: this.streamId,
+          endpoint: "$events",
+          payload: { args: {} },
+        }),
+      )
+    })
+    ws.on("message", (data: Buffer) => {
+      let msg: unknown
+      try {
+        msg = JSON.parse(data.toString())
+      } catch {
+        return
+      }
+      this.handleMessage(msg)
+    })
+    ws.on("close", () => {
+      this.log("remote.mux closed; clearing pending + scheduling reconnect")
+      this.pending.clear()
+      this.clientId = undefined
+      this.ws = null
+      if (!this.closed) this.scheduleReconnect(2000)
+    })
+    ws.on("error", (err: Error) => {
+      this.log(`remote.mux error: ${err.message}`)
+    })
+  }
+
+  private handleMessage(msg: unknown): void {
+    if (!isRecord(msg)) return
+    if (msg["type"] !== "item") return
+    const value = msg["value"]
+    if (!isRecord(value)) return
+    const itemType = value["type"]
+    if (itemType === "ready") {
+      const clientId = value["clientId"]
+      if (typeof clientId === "string") {
+        this.clientId = clientId
+        this.log(`$events stream ready: clientId=${clientId.slice(0, 8)}`)
+      }
+      return
+    }
+    if (itemType === "waterfall") {
+      const eventId = value["eventId"]
+      const event = value["event"]
+      if (typeof eventId === "string" && typeof event === "string") {
+        this.pending.set(eventId, {
+          eventId,
+          event,
+          request: value["request"],
+        })
+        this.log(`pending waterfall: event=${event} eventId=${eventId.slice(0, 8)}`)
+      }
+      return
+    }
+    if (itemType === "emit") {
+      // Event resolved (answered from this client, another client, or timed
+      // out). Remove from pending so the mobile UI stops showing it.
+      const eventId = value["eventId"]
+      if (typeof eventId === "string") {
+        this.pending.delete(eventId)
+      }
+      return
+    }
+    if (itemType === "end") {
+      this.log("$events stream ended; clearing pending + reconnecting")
+      this.pending.clear()
+      this.clientId = undefined
+    }
+  }
+
+  private scheduleReconnect(delayMs: number): void {
+    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = setTimeout(() => this.connect(), delayMs)
+  }
+}
+
 export class DataPlane {
   private fs: FsCap | undefined = undefined
   private workspaceRegistry: WorkspaceRegistryCap | undefined = undefined
@@ -148,6 +334,12 @@ export class DataPlane {
   /** Cached browser-session cookie (`dsh-auth-<hash>=v1.<body>.<sig>`), replayed
    *  as the `Cookie` header on every `/api` POST so requests pass browserAuth. */
   private cookie: string | undefined = undefined
+  /** Persistent WS to dsh web's /api/remote.mux subscribed to $events stream.
+   *  Stores pending user-questions/approval interactions so the mobile UI can
+   *  render them and answer via /api/$events/result. Without this, DSH pauses
+   *  asking the user a question and the task hangs forever (the session log
+   *  only records audit events without the eventId needed to answer). */
+  private eventsClient: RemoteEventsClient | undefined = undefined
 
   constructor(private readonly options: DataPlaneOptions) {}
 
@@ -179,6 +371,20 @@ export class DataPlane {
   setOrigin(origin: string): void {
     this.origin = origin
     console.warn(`[dsh-pocketrelay/data] setOrigin: ${origin}`)
+    // Start the $events stream client: subscribes to /api/remote.mux for
+    // pending user-questions/approval waterfall frames. The client retries
+    // until the cookie is minted (ensureCookie passes it via setCookie).
+    if (this.eventsClient === undefined) {
+      this.eventsClient = new RemoteEventsClient(origin, (msg) => this.options.log(msg))
+      this.eventsClient.setCookie(this.cookie)
+      this.eventsClient.start()
+    }
+  }
+
+  /** Stop the $events stream client (called on plugin dispose). */
+  dispose(): void {
+    this.eventsClient?.stop()
+    this.eventsClient = undefined
   }
 
   /** Set the dsh web launch token (from ctx.get("connection").browserAuth.launchToken).
@@ -206,6 +412,15 @@ export class DataPlane {
       switch (frame.kind) {
         case "conversation":
           await this.conversation(frame)
+          return
+        case "conversation-create":
+          await this.conversationCreate(frame)
+          return
+        case "conversation-pending":
+          await this.conversationPending(frame)
+          return
+        case "conversation-respond":
+          await this.conversationRespond(frame)
           return
         case "send-message":
           await this.sendMessage(frame)
@@ -267,6 +482,10 @@ export class DataPlane {
     this.cookie = (authCookie.split(";")[0] ?? "").trim()
     const cookieName = this.cookie.split("=")[0] ?? "?"
     console.warn(`[dsh-pocketrelay/data] cookie minted: status=${res.status} name=${cookieName}`)
+    // Pass the freshly minted cookie to the $events stream client so it can
+    // open its /api/remote.mux WS (browserAuth requires the cookie on the
+    // upgrade request, same as /api HTTP POSTs).
+    this.eventsClient?.setCookie(this.cookie)
   }
 
   /** POST to the dsh web /api/<namespace>/<method> with the client-request
@@ -343,12 +562,13 @@ export class DataPlane {
       const item = items.find((it) => it?.sessionId === frame.sessionId)
       const asOfSeq = item?.projections?.asOfSeq
       if (typeof asOfSeq !== "number") {
-        this.respond(
-          frame,
-          false,
-          undefined,
-          `session ${frame.sessionId} not found in list or has no projections.asOfSeq`,
-        )
+        // Brand-new session (just created via conversation-create, no events
+        // yet): projections.asOfSeq may be undefined or not yet computed.
+        // Rather than 502-block the chat pane, return an empty page so the
+        // mobile UI shows "暂无消息" and the user can type the first message.
+        // Also covers the race where session/list was read before the new
+        // session appeared (create → attachSession → list may lag by one tick).
+        this.respondData(frame, { records: [], hasMore: false })
         return
       }
       const data = await this.apiCall("session/page", {
@@ -372,6 +592,110 @@ export class DataPlane {
     // starts at the newest page (schema is z.string().optional()).
     const data = await this.apiCall("session/list", { _request: { cursor: "" } })
     this.respondData(frame, data)
+  }
+
+  private async conversationCreate(frame: DataReqFrame): Promise<void> {
+    const workspaceId = frame.workspaceId
+    if (workspaceId === undefined || workspaceId === "") {
+      this.respond(frame, false, undefined, "workspaceId required")
+      return
+    }
+    // session/create: binds a new session to a workspace. The parameter wire
+    // field is `request` (dsh-api-session-controller/lib/typert.host.js:824-834
+    // — single parameter named/wired `request`), so the business params go
+    // under args.request. SessionCreateRequest = { workspaceId?, cwd?,
+    // sessionId?, agentPreset? }; the host rejects workspaceId+cwd together
+    // (index.js:572), so we only ever send workspaceId (matching
+    // dsh-client-ui-workspace's connectWorkspace → sessions.create). The
+    // workspaceId IS the Workspace.id the relay already exposes via the
+    // workspace-list frame (data-plane.ts workspaceList); the host resolves it
+    // to workspace.path via workspaceRegistry.get and attaches the new session
+    // to that workspace (attachSession), so it immediately appears in the
+    // workspace's sessionIds list.
+    // Returns { sessionId, agentPreset? } — no projections. The mobile UI
+    // opens the new session's chat directly from the returned sessionId; if
+    // it needs projections.asOfSeq for a page read, it does a follow-up
+    // session/list lookup (the existing conversation+sessionId branch).
+    const data = await this.apiCall("session/create", {
+      request: { workspaceId },
+    })
+    this.respondData(frame, data)
+  }
+
+  private async conversationPending(frame: DataReqFrame): Promise<void> {
+    // Return all pending user-questions/approval interactions from the
+    // $events stream. The mobile UI polls this alongside session/page to
+    // detect when DSH has paused asking the user a question — without this,
+    // the task hangs forever (the question is invisible in the session log).
+    // We don't filter by sessionId because the $events waterfall frames don't
+    // carry a sessionId field — they carry `agentId` and the request payload
+    // ({questions:[...]} for user-questions/request, {toolName,callId?,reason?}
+    // for approval/request). In practice there's usually one active session on
+    // the phone, so showing all pending interactions is the right UX.
+    const ec = this.eventsClient
+    if (ec === undefined) {
+      this.respond(frame, false, undefined, "events stream client not started")
+      return
+    }
+    const pending = ec.getPending()
+    // Project to a wire-safe shape: {eventId, event, request}[].
+    const data = pending.map((p) => ({
+      eventId: p.eventId,
+      kind: p.event === "approval/request" ? "approval" : "question",
+      request: p.request,
+    }))
+    this.respondData(frame, data)
+  }
+
+  private async conversationRespond(frame: DataReqFrame): Promise<void> {
+    const eventId = frame.eventId
+    const content = frame.content
+    if (eventId === undefined || content === undefined) {
+      this.respond(frame, false, undefined, "eventId and content required")
+      return
+    }
+    const ec = this.eventsClient
+    if (ec === undefined) {
+      this.respond(frame, false, undefined, "events stream client not started")
+      return
+    }
+    const clientId = ec.getClientId()
+    if (clientId === undefined) {
+      this.respond(frame, false, undefined, "$events stream not connected (no clientId)")
+      return
+    }
+    // Parse the answer value from the content field (JSON-stringified by the
+    // relay). For questions: {answers:[{id,selected,custom?}]}; for approvals:
+    // the outcome string "allowed-once" | "rejected".
+    let answerValue: unknown
+    try {
+      answerValue = JSON.parse(content)
+    } catch {
+      this.respond(frame, false, undefined, "invalid response JSON")
+      return
+    }
+    // POST /api/$events/result with the typert envelope. The gateway's
+    // dispatchRpc special-cases "$events/result": parseRemoteEventResultPayload
+    // extracts the RemoteEventResult {clientId, eventId, outcome} from args,
+    // then receiveRemoteEventResult looks up the pending interaction by
+    // eventId and resolves it. The clientId MUST match an active $events
+    // stream (index.js:569-570 throws "identifies no active event stream" if
+    // not), which is why the RemoteEventsClient maintains a persistent WS.
+    try {
+      await this.apiCall("$events/result", {
+        clientId,
+        eventId,
+        outcome: { kind: "result", value: answerValue },
+      })
+    } catch (error) {
+      this.respond(frame, false, undefined, errorMessage(error))
+      return
+    }
+    // Optimistically remove from pending (the emit frame will also arrive,
+    // but we don't want the mobile UI to show a stale pending card while
+    // waiting for the emit).
+    ec.removePending(eventId)
+    this.respond(frame, true)
   }
 
   private async sendMessage(frame: DataReqFrame): Promise<void> {

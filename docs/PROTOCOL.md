@@ -73,6 +73,9 @@ relay 不再反代桌面端 SPA，而是自供一套移动 UI（同源静态页�
 |---|---|---|
 | `GET /api/sessions` | `conversation`（不带 sessionId） | 会话列表 |
 | `GET /api/history?sessionId=` | `conversation`（带 sessionId） | 会话历史 |
+| `POST /api/session/create` `{workspaceId}` | `conversation-create` | 新建会话（绑定到工作区） |
+| `GET /api/session/pending?sessionId=` | `conversation-pending` | 查询待回答问题/批准（host 缓存 $events 流的 pending 交互） |
+| `POST /api/session/respond` `{eventId,response}` | `conversation-respond` | 回答 pending 问题/批准（host 调 /api/$events/result） |
 | `POST /api/message` `{sessionId,text}` | `send-message` | 发送消息 |
 | `GET /api/files?path=` | `file-list` | 列目录 |
 | `GET /api/file?path=` | `file-read` | 读文件 |
@@ -85,7 +88,7 @@ HTTP 状态码映射：未认证 `401`；host 离线 `503`；host 回 `ok:false`
 relay 向 host 发结构化请求，host 用注入的 apiProxy/fs 能力应答：
 
 ```json
-{ "t": "data-req", "id": <int>, "kind": "conversation" | "file-list" | "file-read" | "file-write" | "send-message", "path": "..."?, "content": "..."?, "sessionId": "..."? }
+{ "t": "data-req", "id": <int>, "kind": "conversation" | "conversation-create" | "conversation-pending" | "conversation-respond" | "file-list" | "file-read" | "file-write" | "send-message" | "workspace-list", "path": "..."?, "content": "..."?, "sessionId": "..."?, "workspaceId": "..."?, "eventId": "..."? }
 { "t": "data-res", "id": <int>, "kind": "<同请求>", "ok": true, "data": <...>? }
 { "t": "data-res", "id": <int>, "kind": "<同请求>", "ok": false, "error": "..." }
 ```

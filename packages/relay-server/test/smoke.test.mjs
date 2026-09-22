@@ -184,6 +184,96 @@ test("4. POST /api/message → data-req{kind:'send-message',sessionId,content} �
   assert.equal(req.content, "hi")
 })
 
+test("4b. POST /api/session/create → data-req{kind:'conversation-create',workspaceId} → 200 {ok:true,data:{sessionId}}", async () => {
+  main.received.length = 0
+  main.responder.reply = () => ({ ok: true, data: { sessionId: "s-new", agentPreset: "p1" } })
+  const res = await apiFetch(main.base, "POST", "/api/session/create", {
+    cookie: main.cookie,
+    json: { workspaceId: "ws1" },
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await readJson(res), {
+    ok: true,
+    data: { sessionId: "s-new", agentPreset: "p1" },
+  })
+  assert.equal(main.received.length, 1, "host 收到 1 条 data-req")
+  const req = main.received[0]
+  assert.equal(req.t, "data-req")
+  assert.equal(req.kind, "conversation-create")
+  assert.equal(req.workspaceId, "ws1")
+  // conversation-create 不应携带 sessionId / path / content 字段
+  assert.equal("sessionId" in req, false, "conversation-create 不带 sessionId 字段")
+  assert.equal("path" in req, false, "conversation-create 不带 path 字段")
+  assert.equal("content" in req, false, "conversation-create 不带 content 字段")
+})
+
+test("4c. POST /api/session/create 无 workspaceId → 400", async () => {
+  main.received.length = 0
+  main.responder.reply = () => ({ ok: true })
+  const res = await apiFetch(main.base, "POST", "/api/session/create", {
+    cookie: main.cookie,
+    json: {},
+  })
+  assert.equal(res.status, 400)
+  const body = await readJson(res)
+  assert.equal(body.ok, false)
+  assert.equal(main.received.length, 0, "host 不应收到 data-req（参数校验在 relay 侧）")
+})
+
+test("4d. POST /api/session/create host 离线 → 503", async () => {
+  const res = await apiFetch(offline.base, "POST", "/api/session/create", {
+    cookie: offline.cookie,
+    json: { workspaceId: "ws1" },
+  })
+  assert.equal(res.status, 503)
+  const body = await readJson(res)
+  assert.equal(body.ok, false)
+  assert.ok(body.error.length > 0, "503 携带非空 error")
+})
+
+test("4e. GET /api/session/pending?sessionId=s1 → data-req{kind:'conversation-pending',sessionId} → 200 {ok:true,data:[]}", async () => {
+  main.received.length = 0
+  main.responder.reply = () => ({ ok: true, data: [] })
+  const res = await apiFetch(main.base, "GET", "/api/session/pending?sessionId=s1", {
+    cookie: main.cookie,
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await readJson(res), { ok: true, data: [] })
+  assert.equal(main.received.length, 1, "host 收到 1 条 data-req")
+  const req = main.received[0]
+  assert.equal(req.t, "data-req")
+  assert.equal(req.kind, "conversation-pending")
+  assert.equal(req.sessionId, "s1")
+})
+
+test("4f. POST /api/session/respond {eventId,response} → data-req{kind:'conversation-respond',eventId,content} → 200 {ok:true}", async () => {
+  main.received.length = 0
+  main.responder.reply = () => ({ ok: true })
+  const res = await apiFetch(main.base, "POST", "/api/session/respond", {
+    cookie: main.cookie,
+    json: { eventId: "evt1", response: "allowed-once" },
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await readJson(res), { ok: true })
+  assert.equal(main.received.length, 1, "host 收到 1 条 data-req")
+  const req = main.received[0]
+  assert.equal(req.t, "data-req")
+  assert.equal(req.kind, "conversation-respond")
+  assert.equal(req.eventId, "evt1")
+  // response is JSON-stringified by the relay into content
+  assert.equal(req.content, '"allowed-once"')
+})
+
+test("4g. POST /api/session/respond 无 eventId → 400", async () => {
+  main.received.length = 0
+  const res = await apiFetch(main.base, "POST", "/api/session/respond", {
+    cookie: main.cookie,
+    json: { response: "allowed-once" },
+  })
+  assert.equal(res.status, 400)
+  assert.equal(main.received.length, 0, "host 不应收到 data-req")
+})
+
 test("5. GET /api/file?path=/a/b → data-req{kind:'file-read',path} → 200 {ok:true,data:'file body'}", async () => {
   main.received.length = 0
   main.responder.reply = () => ({ ok: true, data: "file body" })

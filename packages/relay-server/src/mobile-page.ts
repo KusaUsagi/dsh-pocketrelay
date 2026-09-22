@@ -416,6 +416,57 @@ a{color:var(--accent);}
   text-align:center;
 }
 .toast[hidden]{display:none;}
+
+/* ---- pending 问答卡片 ---- */
+.pending-area{
+  padding:8px 12px;
+  border-bottom:1px solid var(--border);
+  background:var(--surface-2);
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.pending-area[hidden]{display:none!important;}
+.pending-card{
+  background:var(--surface-3);
+  border:1px solid var(--border);
+  border-radius:var(--radius-sm);
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.pending-card .pc-title{font-weight:600;font-size:14px;color:var(--warn);}
+.pending-card .pc-desc{font-size:13px;color:var(--text-dim);white-space:pre-wrap;word-break:break-word;}
+.pending-card .pc-actions{display:flex;gap:8px;flex-wrap:wrap;}
+.pending-card .pc-btn{
+  min-height:36px;
+  padding:0 14px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:var(--surface-2);
+  color:var(--text);
+  font:inherit;
+  font-size:14px;
+  cursor:pointer;
+}
+.pending-card .pc-btn:active{background:var(--surface-3);}
+.pending-card .pc-btn.primary{background:var(--success);color:#fff;border-color:var(--success);}
+.pending-card .pc-btn.danger{background:var(--danger);color:#fff;border-color:var(--danger);}
+.pending-card .pc-input{
+  flex:1;
+  min-width:0;
+  min-height:36px;
+  padding:8px 12px;
+  border-radius:8px;
+  border:1px solid var(--border);
+  background:var(--surface-2);
+  color:var(--text);
+  font:inherit;
+  font-size:14px;
+}
+.pending-card .pc-input:focus{outline:none;border-color:var(--accent);}
+.pending-card .pc-btn:disabled{opacity:.55;cursor:default;}
 </style>
 </head>
 <body>
@@ -441,6 +492,9 @@ a{color:var(--accent);}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
         </button>
         <span class="ph-title" id="sessions-title">会话</span>
+        <button type="button" class="icon-btn" id="sessions-new" aria-label="新建会话" title="新建会话" style="margin-left:auto">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
       </div>
       <div class="list" id="session-list" role="list"></div>
     </section>
@@ -453,6 +507,7 @@ a{color:var(--accent);}
         </button>
         <span class="ph-title" id="chat-title">会话</span>
       </div>
+      <div class="pending-area" id="pending-area" hidden></div>
       <div class="chat-scroll" id="chat-events"></div>
       <form class="composer" id="composer">
         <textarea id="composer-text" placeholder="输入消息…" enterkeyhint="send" rows="1"></textarea>
@@ -520,6 +575,9 @@ a{color:var(--accent);}
     workspaces: '/api/workspaces',
     sessions:   '/api/sessions',
     history:    '/api/history',
+    sessionCreate: '/api/session/create',
+    sessionPending: '/api/session/pending',
+    sessionRespond: '/api/session/respond',
     message:    '/api/message',
     files:      '/api/files',
     file:       '/api/file'
@@ -537,7 +595,8 @@ a{color:var(--accent);}
     pollTimer: null,
     pollDeadline: 0,
     lastEventCount: -1,
-    lastChangeAt: 0
+    lastChangeAt: 0,
+    pendingTimer: null
   };
 
   function $(id){ return document.getElementById(id); }
@@ -700,7 +759,7 @@ a{color:var(--accent);}
         }
         return true;
       });
-      if (!filtered.length){ list.appendChild(el('div', 'empty', '该工作区暂无会话')); return; }
+      if (!filtered.length){ list.appendChild(el('div', 'empty', '该工作区暂无会话，点右上角 + 新建')); return; }
       filtered.forEach(function(it){
         var id = (it.sessionId != null) ? it.sessionId : String(it);
         // title lives at projections.values.title (3 levels deep, per
@@ -755,6 +814,30 @@ a{color:var(--accent);}
       S.lastEventCount = evs.length;
       renderEvents(evs);
     }).catch(function(){});
+    // Start the pending-question poll (every 5s, runs continuously while
+    // the chat is open — unlike the 2s message poll which stops after 60s
+    // of no new events, a long tool execution may pause to ask a question
+    // well after the message poll window expires).
+    startPendingPoll(id);
+  }
+
+  /* ---- 新建会话 ---- */
+  function createSession(workspaceId, workspaceTitle){
+    var btn = $('sessions-new');
+    btn.disabled = true;
+    request('POST', EP.sessionCreate, { workspaceId: workspaceId }).then(function(data){
+      // relay wraps data-res as { ok:true, data:<host value> };
+      // session/create returns { sessionId, agentPreset? } — no projections,
+      // no title yet (the session is empty until the first prompt lands).
+      // data-plane 的 conversation+sessionId 分支已处理新会话无 asOfSeq 的
+      // 情形（回空页），故 openSession 不会因新会话而 502。
+      var body = (data && data.data != null) ? data.data : data;
+      var sid = body && body.sessionId;
+      if (!sid){ toast('新建会话失败：未返回 sessionId'); return; }
+      var title = workspaceTitle ? (workspaceTitle + ' · 新会话') : '新会话';
+      openSession(String(sid), title);
+    }).catch(function(){ /* 401/503/网络已处理 */ })
+    .then(function(){ btn.disabled = false; }, function(){ btn.disabled = false; });
   }
 
   function renderEvents(evs){
@@ -866,6 +949,111 @@ a{color:var(--accent);}
       if (Date.now() - S.lastChangeAt > 6000){ stopPoll(); return; }
       if (Date.now() > S.pollDeadline){ stopPoll(); return; }
     }).catch(function(){ /* 401/503 已处理；瞬时错误忽略，下个 tick 重试 */ });
+  }
+
+  /* ---- pending 问答轮询：每 5s 检查是否有待回答问题/批准 ---- */
+  function startPendingPoll(id){
+    stopPendingPoll();
+    loadPending(id);
+    S.pendingTimer = setInterval(function(){ loadPending(id); }, 5000);
+  }
+  function stopPendingPoll(){
+    if (S.pendingTimer){ clearInterval(S.pendingTimer); S.pendingTimer = null; }
+    hide($('pending-area'));
+  }
+  function loadPending(sessionId){
+    request('GET', EP.sessionPending + '?sessionId=' + escUrl(sessionId)).then(function(data){
+      var body = (data && data.data != null) ? data.data : data;
+      var arr = Array.isArray(body) ? body : [];
+      renderPending(arr);
+    }).catch(function(){ /* 401/503 已处理；瞬时错误忽略 */ });
+  }
+  function renderPending(arr){
+    var area = $('pending-area');
+    area.textContent = '';
+    if (!arr.length){ hide(area); return; }
+    show(area);
+    arr.forEach(function(p){
+      if (p && p.kind === 'approval'){ renderApprovalCard(area, p); }
+      else if (p){ renderQuestionCard(area, p); }
+    });
+  }
+  function renderApprovalCard(area, p){
+    var req = (p && p.request) || {};
+    var card = el('div', 'pending-card');
+    card.appendChild(el('div', 'pc-title', '需要批准：' + (req.toolName || '工具调用')));
+    if (req.reason) card.appendChild(el('div', 'pc-desc', String(req.reason)));
+    var actions = el('div', 'pc-actions');
+    var allowBtn = el('button', 'pc-btn primary', '允许');
+    allowBtn.type = 'button';
+    allowBtn.addEventListener('click', function(){ respondPending(p.eventId, 'allowed-once', allowBtn); });
+    var rejectBtn = el('button', 'pc-btn danger', '拒绝');
+    rejectBtn.type = 'button';
+    rejectBtn.addEventListener('click', function(){ respondPending(p.eventId, 'rejected', rejectBtn); });
+    actions.appendChild(allowBtn);
+    actions.appendChild(rejectBtn);
+    card.appendChild(actions);
+    area.appendChild(card);
+  }
+  function renderQuestionCard(area, p){
+    var req = (p && p.request) || {};
+    var questions = Array.isArray(req.questions) ? req.questions : [];
+    questions.forEach(function(q){
+      if (!q) return;
+      var card = el('div', 'pending-card');
+      if (q.header) card.appendChild(el('div', 'pc-title', String(q.header)));
+      if (q.question) card.appendChild(el('div', 'pc-desc', String(q.question)));
+      if (q.detail) card.appendChild(el('div', 'pc-desc', String(q.detail)));
+      var options = Array.isArray(q.options) ? q.options : [];
+      if (options.length){
+        var actions = el('div', 'pc-actions');
+        options.forEach(function(opt, idx){
+          var label = (opt && opt.label) ? String(opt.label) : ('选项 ' + (idx + 1));
+          var desc = (opt && opt.description) ? String(opt.description) : '';
+          var btn = el('button', 'pc-btn', label);
+          btn.type = 'button';
+          if (desc) btn.title = desc;
+          btn.addEventListener('click', function(){
+            respondPending(p.eventId, { answers: [{ id: q.id, selected: idx }] }, btn);
+          });
+          actions.appendChild(btn);
+        });
+        card.appendChild(actions);
+      } else {
+        // 无选项 → 文本输入
+        var form = document.createElement('form');
+        form.className = 'pc-actions';
+        var input = document.createElement('input');
+        input.className = 'pc-input';
+        input.type = 'text';
+        input.placeholder = '输入回答…';
+        input.setAttribute('enterkeyhint', 'done');
+        var submitBtn = el('button', 'pc-btn primary', '提交');
+        submitBtn.type = 'submit';
+        form.appendChild(input);
+        form.appendChild(submitBtn);
+        form.addEventListener('submit', function(e){
+          e.preventDefault();
+          var val = input.value.trim();
+          if (!val) return;
+          respondPending(p.eventId, { answers: [{ id: q.id, selected: 0, custom: val }] }, submitBtn);
+        });
+        card.appendChild(form);
+      }
+      area.appendChild(card);
+    });
+  }
+  function respondPending(eventId, response, btn){
+    btn.disabled = true;
+    request('POST', EP.sessionRespond, { eventId: eventId, response: response }).then(function(data){
+      if (data && data.ok){
+        // 刷新 pending 列表（下一次轮询也会自动刷新）
+        if (S.sessionId) loadPending(S.sessionId);
+      } else {
+        toast('回答失败');
+        btn.disabled = false;
+      }
+    }).catch(function(){ btn.disabled = false; });
   }
 
   /* ---- 文件树 ---- */
@@ -983,8 +1171,16 @@ a{color:var(--accent);}
     show($('pane-workspaces')); hide($('pane-sessions'));
   });
 
+  $('sessions-new').addEventListener('click', function(){
+    // 新建会话：必须在已选定工作区时才可用（host 侧 session/create 需要
+    // workspaceId 把新会话挂到正确的工作区）。工作区未选时回到工作区列表。
+    if (!S.workspaceId){ show($('pane-workspaces')); hide($('pane-sessions')); return; }
+    createSession(S.workspaceId, S.workspaceTitle);
+  });
+
   $('chat-back').addEventListener('click', function(){
     stopPoll();
+    stopPendingPoll();
     S.sessionId = null;
     show($('pane-sessions')); hide($('pane-chat'));
   });

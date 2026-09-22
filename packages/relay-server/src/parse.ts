@@ -90,6 +90,7 @@ function readKind(value: unknown): DataReqKind | null {
     case "file-read":
     case "file-write":
     case "send-message":
+    case "workspace-list":
       return value
     default:
       return null

@@ -635,7 +635,11 @@ a{color:var(--accent);}
       var body = (data && data.data != null) ? data.data : data;
       var arr = Array.isArray(body) ? body : [];
       renderWorkspaces(arr);
-    }).catch(function(){});
+    }).catch(function(){
+      var list = $('workspace-list');
+      list.textContent = '';
+      list.appendChild(el('div', 'empty', '工作区加载失败，请检查 relay 与桌面端版本是否一致'));
+    });
   }
 
   function renderWorkspaces(arr){

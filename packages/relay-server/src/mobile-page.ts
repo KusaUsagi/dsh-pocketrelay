@@ -537,22 +537,6 @@ a{color:var(--accent);}
 
   function escUrl(s){ return encodeURIComponent(String(s)); }
 
-  function pickText(ev){
-    if (ev == null) return '';
-    if (typeof ev === 'string') return ev;
-    var v = ev.text || ev.content || ev.message || ev.delta || ev.output || ev.data || ev.body;
-    if (typeof v === 'string') return v;
-    if (v != null) return JSON.stringify(v);
-    return JSON.stringify(ev);
-  }
-  function pickRole(ev){
-    if (ev == null || typeof ev !== 'object') return 'model';
-    var r = ev.role || ev.type || ev.kind || ev.from || ev.sender || '';
-    r = String(r).toLowerCase();
-    if (r === 'user' || r === 'human' || r === 'you' || r === 'me') return 'user';
-    return 'model';
-  }
-
   /* ---- 请求封装：401/503 特判，其余统一解析 ---- */
   function request(method, url, body){
     var opts = { method: method, headers: { 'accept': 'application/json' }, credentials: 'same-origin' };
@@ -627,14 +611,17 @@ a{color:var(--accent);}
   /* ---- 会话列表 ---- */
   function loadSessions(){
     request('GET', EP.sessions).then(function(data){
+      // relay wraps every data-res as HTTP 200 { ok:true, data:<host value> };
+      // session/list returns { items:[...] }. Unwrap before reading items.
+      var body = (data && data.data != null) ? data.data : data;
       var list = $('session-list');
       list.textContent = '';
-      var items = (data && data.items) || (Array.isArray(data) ? data : []);
+      var items = (body && body.items) || (Array.isArray(body) ? body : []);
       if (!items.length){ list.appendChild(el('div', 'empty', '暂无会话')); return; }
       items.forEach(function(it){
-        var id = (it && it.id != null) ? it.id : String(it);
-        var title = (it && (it.title || it.id)) || String(it);
-        var sub = (it && it.updatedAt) ? String(it.updatedAt) : '';
+        var id = (it && (it.sessionId != null || it.id != null)) ? (it.sessionId != null ? it.sessionId : it.id) : String(it);
+        var title = (it && (it.title || it.id || it.sessionId)) || String(it);
+        var sub = (it && it.updatedAt) ? new Date(it.updatedAt).toLocaleString() : '';
         var row = el('button', 'list-item');
         row.type = 'button';
         row.setAttribute('role', 'listitem');
@@ -657,7 +644,13 @@ a{color:var(--accent);}
     show($('pane-chat')); hide($('pane-sessions'));
     $('chat-events').textContent = '';
     request('GET', EP.history + '?sessionId=' + escUrl(id)).then(function(data){
-      var evs = (data && data.events) || (Array.isArray(data) ? data : []);
+      // relay wraps every data-res as { ok:true, data:<host value> };
+      // session/page returns { records:[...], hasMore }. Each record is
+      // { type:'event', event:{ type, seq, time, data, ... } } — see
+      // dsh-session/lib/index.js:209 deriveEventMessage for the official
+      // event → message projection we mirror in recordToMessage below.
+      var body = (data && data.data != null) ? data.data : data;
+      var evs = (body && body.records) || (body && body.events) || (Array.isArray(body) ? body : []);
       S.lastEventCount = evs.length;
       renderEvents(evs);
     }).catch(function(){});
@@ -667,13 +660,64 @@ a{color:var(--accent);}
     var box = $('chat-events');
     box.textContent = '';
     if (!evs.length){ box.appendChild(el('div', 'empty', '暂无消息')); return; }
-    evs.forEach(function(ev){
-      var role = pickRole(ev);
-      var b = el('div', 'bubble ' + (role === 'user' ? 'b-user' : 'b-model'));
-      b.textContent = pickText(ev);
+    evs.forEach(function(rec){
+      // records are { type:'event', event:{type, seq, time, data,...} }.
+      // Project to a chat bubble only for message-bearing events; skip
+      // tool/step/turn/compaction etc. (mirrors deriveEventMessage).
+      var msg = recordToMessage(rec);
+      if (msg == null) return;
+      var b = el('div', 'bubble ' + (msg.role === 'user' ? 'b-user' : 'b-model'));
+      b.textContent = msg.text;
       box.appendChild(b);
     });
     box.scrollTop = box.scrollHeight;
+  }
+
+  /* Map one session/page record to a {role,text} chat message or null.
+   * Mirrors dsh-session deriveEventMessage + content-text extraction; returns
+   * null for non-message events (filtered out of the chat view). */
+  function recordToMessage(rec){
+    if (rec == null || typeof rec !== 'object') return null;
+    // records are { type:'event', event }; be lenient for raw event shapes.
+    var ev = rec.event || rec;
+    if (ev == null || typeof ev !== 'object') return null;
+    var type = ev.type;
+    if (typeof type !== 'string') return null;
+    var data = ev.data;
+    if (type === 'user/message'){
+      return { role: 'user', text: extractMessageText(data) };
+    }
+    if (type === 'assistant/message' || type === 'system/message'){
+      var m = data && data.message;
+      if (m && m.content && m.content.length === 0) return null;
+      return { role: type === 'system/message' ? 'model' : 'model', text: extractMessageText(m) };
+    }
+    if (type === 'tool/result'){
+      return { role: 'model', text: extractMessageText(data && data.message) };
+    }
+    return null;
+  }
+
+  /* Concatenate the text blocks of a dsh message's content[].
+   * 'message' may be the raw content array, or { content: [...] }, or a
+   * bare string; lenient in either direction. */
+  function extractMessageText(message){
+    if (message == null) return '';
+    if (typeof message === 'string') return message;
+    var content = Array.isArray(message) ? message : message.content;
+    if (!Array.isArray(content)) return JSON.stringify(message);
+    var parts = [];
+    for (var i = 0; i < content.length; i++){
+      var b = content[i];
+      if (b == null) continue;
+      if (typeof b === 'string') { parts.push(b); continue; }
+      if (typeof b === 'object'){
+        if (typeof b.text === 'string') parts.push(b.text);
+        else if (typeof b.content === 'string') parts.push(b.content);
+        else parts.push(JSON.stringify(b));
+      }
+    }
+    return parts.join('');
   }
 
   function setSending(v){
@@ -711,7 +755,8 @@ a{color:var(--accent);}
   function pollTick(id){
     if (Date.now() > S.pollDeadline){ stopPoll(); return; }
     request('GET', EP.history + '?sessionId=' + escUrl(id)).then(function(data){
-      var evs = (data && data.events) || (Array.isArray(data) ? data : []);
+      var body = (data && data.data != null) ? data.data : data;
+      var evs = (body && body.records) || (body && body.events) || (Array.isArray(body) ? body : []);
       renderEvents(evs);
       if (evs.length !== S.lastEventCount){
         S.lastEventCount = evs.length;
@@ -727,7 +772,12 @@ a{color:var(--accent);}
     S.path = path || '';
     var url = EP.files + (S.path ? ('?path=' + escUrl(S.path)) : '');
     request('GET', url).then(function(data){
-      var arr = Array.isArray(data) ? data : (data && data.items) || (data && data.entries) || [];
+      // relay wraps every data-res as { ok:true, data:<host value> };
+      // file-list returns the listDir array directly (no items/entries
+      // wrapper). Unwrap before falling back to legacy shapes.
+      var body = (data && data.data != null) ? data.data : data;
+      var arr = Array.isArray(body) ? body
+              : (body && body.items) || (body && body.entries) || [];
       renderBreadcrumb(S.path);
       renderFileList(arr, S.path);
     }).catch(function(){});
@@ -796,10 +846,13 @@ a{color:var(--accent);}
     $('editor-title').textContent = name || path;
     $('viewer').textContent = '加载中…';
     request('GET', EP.file + '?path=' + escUrl(path)).then(function(data){
+      // relay wraps file-read result as { ok:true, data:<text string> }.
+      // Unwrap before checking legacy content/text fields.
+      var body = (data && data.data != null) ? data.data : data;
       var content = '';
-      if (typeof data === 'string') content = data;
-      else if (data && data.content != null) content = String(data.content);
-      else if (data && data.text != null) content = String(data.text);
+      if (typeof body === 'string') content = body;
+      else if (body && body.content != null) content = String(body.content);
+      else if (body && body.text != null) content = String(body.text);
       S.file = { path: path, content: content };
       $('viewer').textContent = content;
     }).catch(function(){ $('viewer').textContent = '加载失败'; });

@@ -11,6 +11,10 @@
  *    （POST http://127.0.0.1:<webServer.port>/api/session.*）。dsh web 的 /api/*
  *    handler（connection 插件）在其作用域内有 ctx.apiProxy，loopback Host 通过
  *    信任边界，故本插件无需在自己作用域注入 apiProxy 即可调用高层会话网关。
+ *    但 browserAuth.isAuthenticated 会拒绝无 cookie 的请求（0.2.8 的 401），
+ *    故本插件从 ctx.get("connection").browserAuth.launchToken 取进程级启动令牌，
+ *    GET /?token=<token> 铸造签名 cookie（303 Set-Cookie），之后 /api POST 带
+ *    cookie 头通过 browserAuth。见 data-plane.ts 的 ensureCookie() + apiCall()。
  *  - 文件操作（list/read/write）：直接调用 ctx.fs（resolve/listDir/readText/
  *    writeText，method-call 保留 this）。
  *
@@ -73,6 +77,31 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
   ctx.inject(["fs"], (caps) => {
     console.warn("[dsh-pocketrelay] ctx.inject(['fs']) resolved")
     dataPlane.setFs(caps.get("fs"))
+  })
+
+  // The dsh-client-connection service (HostConnectionService) is registered in a
+  // SIBLING plugin's scope, so ctx.get("connection") returns undefined (the
+  // bypass only sees ancestor-scope services; that was the 0.2.9 failure). Use
+  // ctx.inject(["connection"], cb) — same pattern dsh-web-app (lib/index.js:194)
+  // and dsh-api-gateway (lib/index.js:454) use to reach the sibling service.
+  // Inside the cb, connCtx.connection is the HostConnectionService; its public
+  // browserAuth.launchToken mints the browser-session cookie that authorizes
+  // /api POSTs (browserAuth.isAuthenticated rejects cookieless 0.2.8 requests
+  // with 401; the token itself does NOT pass /api auth).
+  ctx.inject(["connection"], (connCtx) => {
+    const conn = (connCtx as Context & { connection?: unknown }).connection
+    const auth =
+      typeof conn === "object" && conn !== null
+        ? (conn as Record<string, unknown>)["browserAuth"]
+        : undefined
+    const token =
+      typeof auth === "object" && auth !== null
+        ? (auth as Record<string, unknown>)["launchToken"]
+        : undefined
+    dataPlane.setLaunchToken(token)
+    console.warn(
+      `[dsh-pocketrelay] ctx.inject(['connection']) resolved: browserAuth=${typeof auth} token=${typeof token === "string" ? `len=${token.length}` : typeof token}`,
+    )
   })
 
   ctx.inject(["webServer"], (webCtx) => {

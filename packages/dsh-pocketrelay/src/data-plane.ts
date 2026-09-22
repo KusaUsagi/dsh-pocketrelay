@@ -8,13 +8,24 @@
  *    scope where ctx.apiProxy IS defined (the web UI uses it), so loopback
  *    fetches pass the trust fence (Host: 127.0.0.1) and reach the high-level
  *    conversation gateway — no apiProxy needed in THIS plugin's scope.
+ *    BUT browserAuth.isAuthenticated then rejects cookieless requests with 401,
+ *    so the plugin mints the browser-session cookie in-process: it reads the
+ *    launch token from `ctx.get("connection").browserAuth.launchToken`, GETs
+ *    `/?token=<token>` (303 Set-Cookie), and replays `cookie: dsh-auth-...=v1...`
+ *    on every /api POST. See `ensureCookie()` + `apiCall()`.
  *  - File ops (list/read/write): direct calls into `ctx.fs` (resolve/listDir/
  *    readText/writeText) with method-call syntax to preserve `this`.
  *
  * The dsh web HTTP API envelope (per harness source):
  *   request  = { type:'client-request', rpcId, method, payload }
  *   response = { type:'server-response', rpcId, result:{ok:true,value} | {ok:false,error} }
- * Methods: session.list, session.history, session.prompt.
+ * Endpoints (namespace/method, slash-separated — dsh-api-gateway endpointOf
+ * joins with `/`, dot-separated names are NOT claimed and 404):
+ *   session/list   — visible Session summaries (returns { items: [...] })
+ *   session/page   — one message-aligned history page (params: address{kind,
+ *                    sessionId}, throughSeq:-1, maxMessages?)
+ *   session/prompt — admit one prompt (params: requestId, sessionId, mode,
+ *                    content[])
  */
 import {
   assertNever,
@@ -85,6 +96,10 @@ function describeFs(fs: unknown): string {
 export class DataPlane {
   private fs: FsCap | undefined = undefined
   private origin: string | undefined = undefined
+  private launchToken: string | undefined = undefined
+  /** Cached browser-session cookie (`dsh-auth-<hash>=v1.<body>.<sig>`), replayed
+   *  as the `Cookie` header on every `/api` POST so requests pass browserAuth. */
+  private cookie: string | undefined = undefined
 
   constructor(private readonly options: DataPlaneOptions) {}
 
@@ -100,6 +115,18 @@ export class DataPlane {
   setOrigin(origin: string): void {
     this.origin = origin
     console.warn(`[dsh-pocketrelay/data] setOrigin: ${origin}`)
+  }
+
+  /** Set the dsh web launch token (from ctx.get("connection").browserAuth.launchToken).
+   *  The token mints the browser-session cookie via GET /?token=<launchToken>,
+   *  which is then replayed on every /api POST (browserAuth.isAuthenticated needs
+   *  the signed cookie; the token alone does NOT pass /api auth). */
+  setLaunchToken(token: unknown): void {
+    this.launchToken = typeof token === "string" && token.length > 0 ? token : undefined
+    // Never log the token itself; only its length, to confirm we got one.
+    console.warn(
+      `[dsh-pocketrelay/data] setLaunchToken: ${this.launchToken === undefined ? "UNDEFINED" : `len=${this.launchToken.length}`}`,
+    )
   }
 
   handle(frame: DataReqFrame): void {
@@ -136,35 +163,100 @@ export class DataPlane {
     }
   }
 
+  /** Mint (or reuse) the dsh web browser-session cookie. The web app's `GET /`
+   *  handler runs `connection.authorizeIndex`, which on a valid `?token=<launchToken>`
+   *  responds 303 with `Set-Cookie: dsh-auth-<hash>=v1.<body>.<sig>; HttpOnly; ...`.
+   *  We capture `name=value` (before the first `;`) and replay it on `/api` POSTs.
+   *  `redirect: "manual"` keeps fetch from following the 303 to `/` (which would
+   *  otherwise 401 because Node fetch does not auto-attach the just-set cookie). */
+  private async ensureCookie(): Promise<void> {
+    if (this.cookie !== undefined) return
+    if (this.origin === undefined) throw new Error("webServer origin not set")
+    if (this.launchToken === undefined) {
+      throw new Error("launch token unavailable (connection.browserAuth.launchToken missing)")
+    }
+    const url = `${this.origin}/?token=${encodeURIComponent(this.launchToken)}`
+    const res = await fetch(url, { method: "GET", redirect: "manual" })
+    // Feature-detect getSetCookie (Node 22 / undici has it); fall back to the
+    // raw combined header value. Cookie values are base64url (`[A-Za-z0-9_-]`
+    // plus `.`), so no `, ` appears inside a single dsh-auth cookie line.
+    const headers = res.headers as Headers & {
+      getSetCookie?: () => string[]
+    }
+    const setCookieList: string[] =
+      typeof headers.getSetCookie === "function"
+        ? headers.getSetCookie()
+        : headers.get("set-cookie") !== null
+          ? [headers.get("set-cookie") as string]
+          : []
+    const authCookie = setCookieList.find((c) => c.startsWith("dsh-auth-"))
+    if (authCookie === undefined) {
+      throw new Error(
+        `cookie mint failed: status=${res.status} set-cookie=${
+          setCookieList.length > 0 ? setCookieList.join(" | ") : "none"
+        }`,
+      )
+    }
+    this.cookie = (authCookie.split(";")[0] ?? "").trim()
+    const cookieName = this.cookie.split("=")[0] ?? "?"
+    console.warn(`[dsh-pocketrelay/data] cookie minted: status=${res.status} name=${cookieName}`)
+  }
+
   /** POST to the dsh web /api/<method> with the client-request envelope; returns
-   *  result.value on ok:true, throws on ok:false / HTTP error. Loopback Host
-   *  passes the trust fence; no token needed. */
+   *  result.value on ok:true, throws on ok:false / HTTP error. The browser-session
+   *  cookie is minted once via ensureCookie() and replayed as the `Cookie` header
+   *  so the request passes browserAuth.isAuthenticated (the loopback Host already
+   *  passes the trust fence). A 401 mid-call clears the cookie, re-mints, retries
+   *  once — covers a stale/expired cookie without a per-request round-trip. */
   private async apiCall(method: string, payload: unknown): Promise<unknown> {
     if (this.origin === undefined) throw new Error("webServer origin not set")
     const rpcId = Math.random().toString(36).slice(2, 12)
-    const res = await fetch(`${this.origin}/api/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "client-request", rpcId, method, payload }),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-    const body = (await res.json()) as ApiResponse
-    if (body?.result?.ok !== true) {
-      throw new Error(body?.result?.error?.message ?? body?.result?.error?.code ?? "api error")
+    const body = JSON.stringify({ type: "client-request", rpcId, method, payload })
+    for (let attempt = 0; ; attempt += 1) {
+      await this.ensureCookie()
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+      }
+      if (this.cookie !== undefined) headers["cookie"] = this.cookie
+      const res = await fetch(`${this.origin}/api/${method}`, {
+        method: "POST",
+        headers,
+        body,
+      })
+      if (res.status === 401 && attempt === 0) {
+        console.warn(
+          `[dsh-pocketrelay/data] api ${method} got 401; re-minting cookie and retrying once`,
+        )
+        this.cookie = undefined
+        continue
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+      const json = (await res.json()) as ApiResponse
+      if (json?.result?.ok !== true) {
+        throw new Error(json?.result?.error?.message ?? json?.result?.error?.code ?? "api error")
+      }
+      return json.result.value
     }
-    return body.result.value
   }
 
   private async conversation(frame: DataReqFrame): Promise<void> {
     if (frame.sessionId !== undefined) {
-      const data = await this.apiCall("session.history", {
-        sessionId: frame.sessionId,
+      // session/page: read one message-aligned history page. The endpoint is
+      // `namespace/method` (slash, not dot — dsh typert gateway's endpointOf
+      // joins with `/`, see dsh-api-gateway/lib/index.js:990). `throughSeq:-1`
+      // is the documented "no upper bound" sentinel; `address.kind:"session"`
+      // is the only branch this plugin addresses (no subagent remoting).
+      const data = await this.apiCall("session/page", {
+        address: { kind: "session", sessionId: frame.sessionId },
+        throughSeq: -1,
         maxMessages: 200,
       })
       this.respondData(frame, data)
       return
     }
-    const data = await this.apiCall("session.list", { cursor: "" })
+    // session/list: returns { items: [...] }. cursor is optional; omitting it
+    // starts at the newest. Use "" explicitly so the schema gets a string.
+    const data = await this.apiCall("session/list", { cursor: "" })
     this.respondData(frame, data)
   }
 
@@ -175,7 +267,12 @@ export class DataPlane {
       this.respond(frame, false, undefined, "sessionId and content required")
       return
     }
-    const data = await this.apiCall("session.prompt", {
+    // session/prompt: requestId is a REQUIRED wire field (per the typert
+    // schema in dsh-api-session-controller/lib/typert.host.js:573-590). It is
+    // the host-side idempotency/correlation key for this prompt; generate a
+    // short random id (same shape as apiCall's rpcId, scoped to prompts).
+    const data = await this.apiCall("session/prompt", {
+      requestId: Math.random().toString(36).slice(2, 12),
       sessionId,
       mode: "queue",
       content: [{ type: "text", text: content }],
@@ -197,8 +294,11 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
-    // No path → resolve "." (workspace cwd). resolve takes a string, returns FsTarget.
-    const target = fs.resolve(frame.path ?? ".")
+    // No path → resolve "." (workspace cwd). resolve is async (dsh-fs-local
+    // LocalFileSystem.resolve returns Promise<FsTarget>); await before listDir,
+    // else target is a Promise and listDir reads target.displayPath → undefined
+    // → "cannot list undefined".
+    const target = await fs.resolve(frame.path ?? ".")
     const data = await fs.listDir(target)
     this.respondData(frame, data)
   }
@@ -217,7 +317,7 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.readText unavailable")
       return
     }
-    const target = fs.resolve(frame.path)
+    const target = await fs.resolve(frame.path)
     const data = await fs.readText(target)
     this.respondData(frame, data)
   }
@@ -236,7 +336,7 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.writeText unavailable")
       return
     }
-    const target = fs.resolve(frame.path)
+    const target = await fs.resolve(frame.path)
     await fs.writeText(target, frame.content)
     this.respond(frame, true)
   }

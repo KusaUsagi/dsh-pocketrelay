@@ -16,8 +16,12 @@
  *  - File ops (list/read/write): direct calls into `ctx.fs` (resolve/listDir/
  *    readText/writeText) with method-call syntax to preserve `this`.
  *
- * The dsh web HTTP API envelope (per harness source):
+ * The dsh web HTTP API envelope (per dsh-client-connection clientRequestSchema
+ * + dsh-api-gateway remoteRequest):
  *   request  = { type:'client-request', rpcId, method, payload }
+ *              where `payload` MUST be `{ args: <plain-object> }` — business
+ *              params go under payload.args (remoteRequest throws if `args`
+ *              is absent or payload has extra keys)
  *   response = { type:'server-response', rpcId, result:{ok:true,value} | {ok:false,error} }
  * Endpoints (namespace/method, slash-separated — dsh-api-gateway endpointOf
  * joins with `/`, dot-separated names are NOT claimed and 404):
@@ -38,8 +42,25 @@ import {
 /** 1 MiB serialized ceiling for a `data-res` frame (string length, not bytes). */
 const MAX_PAYLOAD_CHARS = 1048576
 
+/** Workspace cwd used as the base for every fs.resolve call.
+ *  dsh-fs-local's LocalFileSystem.config.cwd defaults to process.cwd() —
+ *  which is the directory `dsh --profile web` was launched from (typically
+ *  C:\Users\<user>, NOT the project workspace). Until the relay/host pair
+ *  exposes a workspace selector in the pairing flow, hardcode the testing
+ *  workspace so the mobile file tree points at the project, not the user
+ *  home. TODO: replace with a per-session/per-workspace selector once
+ *  multi-workspace lands. */
+const WORKSPACE_CWD = "D:/Desktop/myWorkspace/dsh-workspace"
+
+/** dsh-fs-local LocalFileSystem.resolve accepts an optional opts.cwd that
+ *  overrides config.cwd for one resolution. Modeled as a narrow structural
+ *  type so the plugin compiles without importing @deepseek-ai/dsh-fs-local. */
+interface FsResolveOpts {
+  cwd?: string
+}
+
 interface FsCap {
-  resolve?: (path: unknown) => unknown
+  resolve?: (path: unknown, opts?: FsResolveOpts) => unknown
   listDir?: (path: unknown) => Promise<unknown>
   readText?: (path: unknown) => Promise<unknown>
   writeText?: (path: unknown, content: unknown) => Promise<unknown>
@@ -202,16 +223,30 @@ export class DataPlane {
     console.warn(`[dsh-pocketrelay/data] cookie minted: status=${res.status} name=${cookieName}`)
   }
 
-  /** POST to the dsh web /api/<method> with the client-request envelope; returns
-   *  result.value on ok:true, throws on ok:false / HTTP error. The browser-session
-   *  cookie is minted once via ensureCookie() and replayed as the `Cookie` header
-   *  so the request passes browserAuth.isAuthenticated (the loopback Host already
-   *  passes the trust fence). A 401 mid-call clears the cookie, re-mints, retries
-   *  once — covers a stale/expired cookie without a per-request round-trip. */
-  private async apiCall(method: string, payload: unknown): Promise<unknown> {
+  /** POST to the dsh web /api/<namespace>/<method> with the client-request
+   *  envelope; returns result.value on ok:true, throws on ok:false / HTTP error.
+   *  The browser-session cookie is minted once via ensureCookie() and replayed
+   *  as the `Cookie` header so the request passes browserAuth.isAuthenticated
+   *  (the loopback Host already passes the trust fence). A 401 mid-call clears
+   *  the cookie, re-mints, retries once — covers a stale/expired cookie without
+   *  a per-request round-trip.
+   *
+   *  Wire envelope (per dsh-client-connection clientRequestSchema +
+   *  dsh-api-gateway remoteRequest): `payload` MUST be `{ args: <plain-object>
+   *  }` — the typert gateway refuses payloads with any other shape (its
+   *  remoteRequest throws "Remote payload must contain exactly one plain-object
+   *  args field" if `args` is absent or `payload` has extra keys). So the
+   *  business params (cursor / address+throughSeq / requestId+sessionId+mode+
+   *  content) go under `payload.args`, not at the payload top level. */
+  private async apiCall(method: string, params: unknown): Promise<unknown> {
     if (this.origin === undefined) throw new Error("webServer origin not set")
     const rpcId = Math.random().toString(36).slice(2, 12)
-    const body = JSON.stringify({ type: "client-request", rpcId, method, payload })
+    const body = JSON.stringify({
+      type: "client-request",
+      rpcId,
+      method,
+      payload: { args: params },
+    })
     for (let attempt = 0; ; attempt += 1) {
       await this.ensureCookie()
       const headers: Record<string, string> = {
@@ -294,11 +329,12 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.listDir unavailable")
       return
     }
-    // No path → resolve "." (workspace cwd). resolve is async (dsh-fs-local
+    // No path → resolve "." against WORKSPACE_CWD (the project workspace, not
+    // dsh's process.cwd() which is the user home). resolve is async (dsh-fs-local
     // LocalFileSystem.resolve returns Promise<FsTarget>); await before listDir,
     // else target is a Promise and listDir reads target.displayPath → undefined
     // → "cannot list undefined".
-    const target = await fs.resolve(frame.path ?? ".")
+    const target = await fs.resolve(frame.path ?? ".", { cwd: WORKSPACE_CWD })
     const data = await fs.listDir(target)
     this.respondData(frame, data)
   }
@@ -317,7 +353,7 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.readText unavailable")
       return
     }
-    const target = await fs.resolve(frame.path)
+    const target = await fs.resolve(frame.path, { cwd: WORKSPACE_CWD })
     const data = await fs.readText(target)
     this.respondData(frame, data)
   }
@@ -336,7 +372,7 @@ export class DataPlane {
       this.respond(frame, false, undefined, "fs.writeText unavailable")
       return
     }
-    const target = await fs.resolve(frame.path)
+    const target = await fs.resolve(frame.path, { cwd: WORKSPACE_CWD })
     await fs.writeText(target, frame.content)
     this.respond(frame, true)
   }

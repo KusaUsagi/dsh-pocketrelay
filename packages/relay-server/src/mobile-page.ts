@@ -428,9 +428,20 @@ a{color:var(--accent);}
   <div class="offline-banner" id="offline-banner" hidden>主机离线，将在下次操作时重试</div>
 
   <main class="content">
+    <!-- 工作区列表 -->
+    <section class="pane" id="pane-workspaces">
+      <div class="pane-head"><span class="ph-title">工作区</span></div>
+      <div class="list" id="workspace-list" role="list"></div>
+    </section>
+
     <!-- 会话列表 -->
-    <section class="pane" id="pane-sessions">
-      <div class="pane-head"><span class="ph-title">会话</span></div>
+    <section class="pane" id="pane-sessions" hidden>
+      <div class="pane-head">
+        <button type="button" class="icon-btn" id="sessions-back" aria-label="返回工作区列表">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <span class="ph-title" id="sessions-title">会话</span>
+      </div>
       <div class="list" id="session-list" role="list"></div>
     </section>
 
@@ -506,15 +517,19 @@ a{color:var(--accent);}
   'use strict';
 
   var EP = {
-    sessions: '/api/sessions',
-    history:  '/api/history',
-    message:  '/api/message',
-    files:    '/api/files',
-    file:     '/api/file'
+    workspaces: '/api/workspaces',
+    sessions:   '/api/sessions',
+    history:    '/api/history',
+    message:    '/api/message',
+    files:      '/api/files',
+    file:       '/api/file'
   };
 
   var S = {
     tab: 'chat',
+    workspaceId: null,
+    workspaceTitle: null,
+    workspaceSessionIds: null,
     sessionId: null,
     path: '',
     file: null,
@@ -596,8 +611,11 @@ a{color:var(--accent);}
       t.classList.toggle('active', t.getAttribute('data-tab') === name);
     });
     if (name === 'chat'){
-      if (S.sessionId){ show($('pane-chat')); hide($('pane-sessions')); }
-      else { show($('pane-sessions')); hide($('pane-chat')); }
+      // chat tab: workspace list → (select) → session list → (open) → chat.
+      // Backing out of chat/session resets to workspace list.
+      if (S.sessionId){ show($('pane-chat')); hide($('pane-sessions')); hide($('pane-workspaces')); }
+      else if (S.workspaceId){ show($('pane-sessions')); hide($('pane-workspaces')); hide($('pane-chat')); }
+      else { show($('pane-workspaces')); hide($('pane-sessions')); hide($('pane-chat')); }
       hide($('pane-files')); hide($('pane-editor'));
     } else if (name === 'files'){
       show($('pane-files')); hide($('pane-editor'));
@@ -608,20 +626,83 @@ a{color:var(--accent);}
     t.addEventListener('click', function(){ switchTab(t.getAttribute('data-tab')); });
   });
 
+  /* ---- 工作区列表 ---- */
+  function loadWorkspaces(){
+    request('GET', EP.workspaces).then(function(data){
+      // workspace-list returns the durable registry order: [{id, path, title,
+      // sessionIds, createdAt, updatedAt}]. Each entity's sessionIds is already
+      // filtered by the registry's startup canonical-cwd index.
+      var body = (data && data.data != null) ? data.data : data;
+      var arr = Array.isArray(body) ? body : [];
+      renderWorkspaces(arr);
+    }).catch(function(){});
+  }
+
+  function renderWorkspaces(arr){
+    var list = $('workspace-list');
+    list.textContent = '';
+    if (!arr.length){ list.appendChild(el('div', 'empty', '暂无工作区')); return; }
+    arr.forEach(function(w){
+      var title = (w && w.title) || (w && w.path ? w.path.split(/[\\/]/).pop() : '工作区');
+      var sub = (w && w.sessionIds && w.sessionIds.length)
+        ? w.sessionIds.length + ' 个会话'
+        : '空';
+      var row = el('button', 'list-item');
+      row.type = 'button';
+      row.setAttribute('role', 'listitem');
+      row.appendChild(iconSpan('folder'));
+      var main = el('div', 'li-main');
+      main.appendChild(el('span', 'li-title', String(title)));
+      main.appendChild(el('span', 'li-sub', String(sub)));
+      row.appendChild(main);
+      row.addEventListener('click', function(){ selectWorkspace(String(w.id), String(title), w.sessionIds || []); });
+      list.appendChild(row);
+    });
+  }
+
+  function selectWorkspace(id, title, sessionIds){
+    S.workspaceId = id;
+    S.workspaceTitle = title;
+    S.workspaceSessionIds = sessionIds;
+    $('sessions-title').textContent = title;
+    show($('pane-sessions')); hide($('pane-workspaces'));
+    loadSessions(id, sessionIds);
+  }
+
   /* ---- 会话列表 ---- */
-  function loadSessions(){
+  function loadSessions(workspaceId, workspaceSessionIds){
+    var list = $('session-list');
+    list.textContent = '';
+    list.appendChild(el('div', 'empty', '加载中…'));
     request('GET', EP.sessions).then(function(data){
       // relay wraps every data-res as HTTP 200 { ok:true, data:<host value> };
       // session/list returns { items:[...] }. Unwrap before reading items.
       var body = (data && data.data != null) ? data.data : data;
-      var list = $('session-list');
-      list.textContent = '';
       var items = (body && body.items) || (Array.isArray(body) ? body : []);
-      if (!items.length){ list.appendChild(el('div', 'empty', '暂无会话')); return; }
-      items.forEach(function(it){
-        var id = (it && (it.sessionId != null || it.id != null)) ? (it.sessionId != null ? it.sessionId : it.id) : String(it);
-        var title = (it && (it.title || it.id || it.sessionId)) || String(it);
-        var sub = (it && it.updatedAt) ? new Date(it.updatedAt).toLocaleString() : '';
+      list.textContent = '';
+      // Keep only sessions belonging to the selected workspace (by sessionId
+      // membership in workspace.sessionIds) AND filter out subagent sessions
+      // (origin==="subagent") — those cannot be read via session/page's
+      // {kind:"session"} address; dsh's sourceFor (index.js:1578) rejects
+      // them with "subagent Sessions require their durable parent address".
+      var idSet = {};
+      if (workspaceSessionIds) workspaceSessionIds.forEach(function(sid){ idSet[sid] = true; });
+      var filtered = items.filter(function(it){
+        if (!it) return false;
+        if (it.origin === 'subagent') return false;
+        if (workspaceSessionIds){
+          var sid = it.sessionId != null ? it.sessionId : (it.id != null ? it.id : null);
+          return sid != null && idSet[sid] === true;
+        }
+        return true;
+      });
+      if (!filtered.length){ list.appendChild(el('div', 'empty', '该工作区暂无会话')); return; }
+      filtered.forEach(function(it){
+        var id = (it.sessionId != null) ? it.sessionId : String(it);
+        // title lives at projections.values.title (3 levels deep, per
+        // typert.host.js:421-429); fallback to sessionId prefix.
+        var title = extractSessionTitle(it) || String(id).slice(0, 8);
+        var sub = (it.updatedAt) ? new Date(it.updatedAt).toLocaleString() : '';
         var row = el('button', 'list-item');
         row.type = 'button';
         row.setAttribute('role', 'listitem');
@@ -634,6 +715,22 @@ a{color:var(--accent);}
         list.appendChild(row);
       });
     }).catch(function(){});
+  }
+
+  /* Extract a session's display title from its projection values.
+   * session/list items carry { sessionId, projections: { values: { title?, ... } } }.
+   * Returns the title string when present and non-empty, else ''. */
+  function extractSessionTitle(it){
+    if (!it || typeof it !== 'object') return '';
+    var proj = it.projections;
+    if (proj && typeof proj === 'object'){
+      var vals = proj.values;
+      if (vals && typeof vals === 'object'){
+        var t = vals.title;
+        if (typeof t === 'string' && t.length > 0) return t;
+      }
+    }
+    return '';
   }
 
   /* ---- 聊天详情 ---- */
@@ -875,6 +972,13 @@ a{color:var(--accent);}
   }
 
   /* ---- 事件绑定 ---- */
+  $('sessions-back').addEventListener('click', function(){
+    // Back out of session list → workspace list.
+    S.workspaceId = null;
+    S.workspaceSessionIds = null;
+    show($('pane-workspaces')); hide($('pane-sessions'));
+  });
+
   $('chat-back').addEventListener('click', function(){
     stopPoll();
     S.sessionId = null;
@@ -928,7 +1032,7 @@ a{color:var(--accent);}
   /* ---- 初始化 ---- */
   setStatus('online');
   switchTab('chat');
-  loadSessions();
+  loadWorkspaces();
   loadFiles('');
 })();
 </script>

@@ -79,6 +79,9 @@ export class DataApi {
     const deviceId = session.deviceId
     this.opts.log(`api ${method} ${path} device=${deviceId.slice(0, 8)}`)
 
+    if (method === "GET" && path === "/api/workspaces") {
+      return this.mint(res, deviceId, { kind: "workspace-list" })
+    }
     if (method === "GET" && path === "/api/sessions") {
       return this.mint(res, deviceId, { kind: "conversation" })
     }

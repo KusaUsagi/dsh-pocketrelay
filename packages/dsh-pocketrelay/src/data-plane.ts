@@ -66,6 +66,28 @@ interface FsCap {
   writeText?: (path: unknown, content: unknown) => Promise<unknown>
 }
 
+/** Narrow structural type for ctx.workspaceRegistry (dsh-workspace's
+ *  WorkspaceRegistry Service). We only call the synchronous `list()` method,
+ *  which returns ordered Workspace entities. Each entity exposes `id`,
+ *  `path`, `title`, `createdAt`, `updatedAt`, and a `sessionIds` getter —
+ *  all plain JSON-safe strings, so we project them to a serializable shape
+ *  before sending over the wire. Modeled structurally so the plugin compiles
+ *  without importing @deepseek-ai/dsh-workspace. */
+interface WorkspaceEntityCap {
+  readonly id: string
+  readonly path: string
+  readonly title: string
+  readonly createdAt: string
+  readonly updatedAt: string
+  /** Getter filtered by the registry's startup header-cwd index; returns
+   *  only the session ids that still belong to this workspace's path. */
+  readonly sessionIds: string[]
+}
+
+interface WorkspaceRegistryCap {
+  list: () => WorkspaceEntityCap[]
+}
+
 interface MutableDataRes {
   t: "data-res"
   id: number
@@ -116,6 +138,7 @@ function describeFs(fs: unknown): string {
 
 export class DataPlane {
   private fs: FsCap | undefined = undefined
+  private workspaceRegistry: WorkspaceRegistryCap | undefined = undefined
   private origin: string | undefined = undefined
   private launchToken: string | undefined = undefined
   /** Cached browser-session cookie (`dsh-auth-<hash>=v1.<body>.<sig>`), replayed
@@ -129,6 +152,22 @@ export class DataPlane {
     this.fs = typeof fs === "object" && fs !== null ? (fs as FsCap) : undefined
     console.warn(
       `[dsh-pocketrelay/data] setFs: ${this.fs === undefined ? "UNDEFINED" : describeFs(this.fs)}`,
+    )
+  }
+
+  /** Set the workspace registry cap (from ctx.get("workspaceRegistry") or
+   *  ctx.inject(["workspaceRegistry"])). Used by the `workspace-list` frame
+   *  to return the durable workspace order + each workspace's path/title/
+   *  sessionIds — the mobile UI groups sessions under their owning workspace. */
+  setWorkspaceRegistry(reg: unknown): void {
+    this.workspaceRegistry =
+      typeof reg === "object" &&
+      reg !== null &&
+      typeof (reg as WorkspaceRegistryCap).list === "function"
+        ? (reg as WorkspaceRegistryCap)
+        : undefined
+    console.warn(
+      `[dsh-pocketrelay/data] setWorkspaceRegistry: ${this.workspaceRegistry === undefined ? "UNDEFINED" : "OK"}`,
     )
   }
 
@@ -175,6 +214,9 @@ export class DataPlane {
           return
         case "file-write":
           await this.fileWrite(frame)
+          return
+        case "workspace-list":
+          await this.workspaceList(frame)
           return
         default:
           assertNever(frame.kind)
@@ -386,6 +428,29 @@ export class DataPlane {
     const target = await fs.resolve(frame.path, { cwd: WORKSPACE_CWD })
     await fs.writeText(target, frame.content)
     this.respond(frame, true)
+  }
+
+  private async workspaceList(frame: DataReqFrame): Promise<void> {
+    const reg = this.workspaceRegistry
+    if (reg === undefined) {
+      this.respond(frame, false, undefined, "workspaceRegistry service unavailable")
+      return
+    }
+    // ctx.workspaceRegistry.list() is synchronous and returns ordered entities;
+    // project each to a plain JSON-safe object (the entity's sessionIds getter
+    // is already filtered by the registry's startup canonical-cwd index, so
+    // only sessions whose header.cwd still resolves to this workspace's path
+    // are listed — no orphan/stale ids leak to the mobile UI).
+    const entities = reg.list()
+    const data = entities.map((w) => ({
+      id: w.id,
+      path: w.path,
+      title: w.title,
+      sessionIds: [...w.sessionIds],
+      createdAt: w.createdAt,
+      updatedAt: w.updatedAt,
+    }))
+    this.respondData(frame, data)
   }
 
   /** Serialize + size-guard a result; logs shape BEFORE the size check. */

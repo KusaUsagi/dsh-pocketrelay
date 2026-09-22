@@ -200,7 +200,13 @@ export interface WsCloseFrame {
 }
 
 /** relay→host：结构化数据请求（新数据面，取代 http/ws 反代）。 */
-export type DataReqKind = "conversation" | "file-list" | "file-read" | "file-write" | "send-message"
+export type DataReqKind =
+  | "conversation"
+  | "file-list"
+  | "file-read"
+  | "file-write"
+  | "send-message"
+  | "workspace-list"
 
 export interface DataReqFrame {
   readonly t: "data-req"

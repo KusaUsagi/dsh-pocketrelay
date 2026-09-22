@@ -79,6 +79,18 @@ export async function apply(ctx: Context, config: RemoteSettings): Promise<void>
     dataPlane.setFs(caps.get("fs"))
   })
 
+  // Workspace registry (dsh-workspace's WorkspaceRegistry Service). Registered
+  // by the base bundle; exposes the durable workspace order + each workspace's
+  // path/title/sessionIds. Used by the `workspace-list` data frame so the
+  // mobile UI can render workspace → session grouping instead of a flat list.
+  ctx.inject(["workspaceRegistry"], (wCtx) => {
+    const reg = (wCtx as Context & { workspaceRegistry?: unknown }).workspaceRegistry
+    console.warn(
+      `[dsh-pocketrelay] ctx.inject(['workspaceRegistry']) resolved: ${typeof reg === "object" && reg !== null ? "OK" : typeof reg}`,
+    )
+    dataPlane.setWorkspaceRegistry(reg)
+  })
+
   // The dsh-client-connection service (HostConnectionService) is registered in a
   // SIBLING plugin's scope, so ctx.get("connection") returns undefined (the
   // bypass only sees ancestor-scope services; that was the 0.2.9 failure). Use
